@@ -15,27 +15,16 @@
 #       or prompts for key server URL, or allows manual paste as fallback)
 #   6.  Stores the Ansible public key and adds it to authorized_keys
 #   7.  Interactively collects park config and writes /home/ridestatus/.env
-#   8.  Configures chrony using the actual dept NIC subnet (stratum 2 internet,
-#       NTP server for edge nodes — allow scoped to dept subnet, not 0.0.0.0/0)
+#       Includes ANSIBLE_VM_HOST so the management UI can reach the Ansible VM
+#   8.  Configures chrony (stratum 2, serves dept subnet)
 #   9.  Creates ridestatus DB user and database
 #  10.  Clones ridestatus-server, installs npm deps, runs DB migrations
 #  11.  Installs PM2, registers ridestatus-server, enables PM2 startup
-#  12.  Configures UFW firewall (NTP restricted to dept subnet)
-#  13.  Prints a deployment summary
-#
-# Key handoff modes (in priority order):
-#   A) ANSIBLE_PUBKEY env var  — set by deploy.sh when both VMs are on the
-#      same Proxmox host. Fully automatic, no tech interaction needed.
-#   B) ANSIBLE_KEY_URL env var — set by deploy.sh when Ansible VM is on a
-#      different host. Script fetches key from URL automatically.
-#   C) Interactive prompt       — script asks for the key server URL.
-#      Tech copies it from the ansible.sh terminal output.
-#   D) Manual paste fallback    — if URL unreachable, tech pastes key directly.
+#  12.  Configures UFW firewall
+#  13.  Prints deployment summary with management UI URL
 #
 # Usage (called by deploy.sh via SSH, or manually):
 #   curl -fsSL https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap/server.sh | sudo bash
-#   # Or with env var from deploy.sh:
-#   ANSIBLE_PUBKEY="ssh-ed25519 AAAA..." sudo bash server.sh
 # =============================================================================
 
 set -euo pipefail
@@ -64,31 +53,21 @@ prompt_required() {
   done
 }
 
-# Derive the network CIDR for a given interface using ipcalc-style logic.
-# e.g. IP=10.15.140.101, prefix=25 → "10.15.140.128/25" (network address/prefix)
-# Returns empty string if the interface has no IPv4 address yet.
 dept_nic_subnet() {
   local iface=$1
-  local ip prefix network
-
-  # ip -o -4 addr: "2: ens18    inet 10.15.140.101/25 ..."
+  local ip prefix
   read -r ip prefix < <(
     ip -o -4 addr show dev "$iface" 2>/dev/null \
     | awk '{split($4,a,"/"); print a[1], a[2]}' | head -1
   ) || true
-
   [[ -z "$ip" || -z "$prefix" ]] && return 0
-
-  # Convert dotted IP to integer, mask off host bits, convert back
   IFS=. read -r a b c d <<< "$ip"
   local ip_int=$(( (a<<24) | (b<<16) | (c<<8) | d ))
   local mask=$(( 0xFFFFFFFF << (32 - prefix) & 0xFFFFFFFF ))
   local net_int=$(( ip_int & mask ))
   printf "%d.%d.%d.%d/%d\n" \
-    $(( (net_int>>24) & 0xFF )) \
-    $(( (net_int>>16) & 0xFF )) \
-    $(( (net_int>>8)  & 0xFF )) \
-    $((  net_int      & 0xFF )) \
+    $(( (net_int>>24) & 0xFF )) $(( (net_int>>16) & 0xFF )) \
+    $(( (net_int>>8)  & 0xFF )) $((  net_int      & 0xFF )) \
     "$prefix"
 }
 
@@ -110,16 +89,8 @@ header "Installing System Packages"
 
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-  curl \
-  git \
-  ca-certificates \
-  gnupg \
-  lsb-release \
-  ufw \
-  jq \
-  chrony \
-  build-essential \
-  python3
+  curl git ca-certificates gnupg lsb-release \
+  ufw jq chrony build-essential python3 openssh-client
 
 ok "Packages installed"
 
@@ -144,7 +115,6 @@ header "Installing PostgreSQL 16"
 if command -v psql &>/dev/null && psql --version | grep -q ' 16\.'; then
   info "PostgreSQL 16 already installed"
 else
-  info "Adding PGDG apt repository..."
   curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
     | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
   echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] \
@@ -177,13 +147,7 @@ chown -R "${RS_USER}:${RS_USER}" "$RS_HOME"
 ok "Home directory ready: ${RS_HOME}"
 
 # =============================================================================
-# 5 & 6. Ansible public key acquisition
-#
-# Priority:
-#   A) ANSIBLE_PUBKEY env var (set by deploy.sh — same-host deployment)
-#   B) ANSIBLE_KEY_URL env var (set by deploy.sh — cross-host deployment)
-#   C) Interactive: prompt for key server URL, then fetch
-#   D) Manual paste fallback (if fetch fails or times out)
+# 5 & 6. Ansible public key
 # =============================================================================
 header "Ansible Public Key"
 
@@ -192,38 +156,30 @@ ANSIBLE_PUBKEY_CONTENT=""
 if [[ -n "${ANSIBLE_PUBKEY:-}" ]]; then
   ANSIBLE_PUBKEY_CONTENT="$ANSIBLE_PUBKEY"
   ok "Ansible public key received from deploy.sh (same-host mode)"
-
 elif [[ -n "${ANSIBLE_KEY_URL:-}" ]]; then
   info "Fetching Ansible public key from ${ANSIBLE_KEY_URL}..."
   ANSIBLE_PUBKEY_CONTENT=$(curl -fsSL --max-time 15 "$ANSIBLE_KEY_URL" 2>/dev/null || true)
-  if [[ -n "$ANSIBLE_PUBKEY_CONTENT" ]]; then
-    ok "Ansible public key fetched from URL"
-  else
-    warn "Could not fetch from ANSIBLE_KEY_URL — falling back to interactive prompt"
-  fi
+  [[ -n "$ANSIBLE_PUBKEY_CONTENT" ]] && ok "Ansible public key fetched from URL" \
+    || warn "Could not fetch from ANSIBLE_KEY_URL — falling back to interactive prompt"
 fi
 
 if [[ -z "$ANSIBLE_PUBKEY_CONTENT" ]]; then
   echo ""
   echo -e "${BOLD}${YELLOW}Ansible public key needed${RESET}"
-  echo "  The Ansible Controller VM printed a key server URL when ansible.sh ran."
+  echo "  The Ansible VM printed a key server URL when ansible.sh ran."
   echo "  Example: http://10.15.140.100:${KEY_SERVER_PORT}/ansible_ridestatus.pub"
   echo ""
-  read -rp "$(echo -e "${BOLD}  Key server URL (or press Enter to paste key manually): ${RESET}")" key_url
+  read -rp "$(echo -e "${BOLD}  Key server URL (or press Enter to paste manually): ${RESET}")" key_url
 
   if [[ -n "$key_url" ]]; then
-    info "Fetching Ansible public key from ${key_url}..."
     ANSIBLE_PUBKEY_CONTENT=$(curl -fsSL --max-time 15 "$key_url" 2>/dev/null || true)
-    if [[ -n "$ANSIBLE_PUBKEY_CONTENT" ]]; then
-      ok "Ansible public key fetched"
-    else
-      warn "Could not reach key server. Falling back to manual paste."
-    fi
+    [[ -n "$ANSIBLE_PUBKEY_CONTENT" ]] && ok "Ansible public key fetched" \
+      || warn "Could not reach key server. Falling back to manual paste."
   fi
 
   if [[ -z "$ANSIBLE_PUBKEY_CONTENT" ]]; then
     echo ""
-    echo -e "${BOLD}  Paste the Ansible public key (single line, starts with 'ssh-ed25519'):${RESET}"
+    echo -e "${BOLD}  Paste the Ansible public key (starts with 'ssh-ed25519'):${RESET}"
     while true; do
       read -rp "  Public key: " ANSIBLE_PUBKEY_CONTENT
       echo "$ANSIBLE_PUBKEY_CONTENT" | grep -qE '^(ssh-ed25519|ssh-rsa|ecdsa-sha2) ' && break
@@ -248,11 +204,9 @@ else
   echo "$ANSIBLE_PUBKEY_CONTENT" >> "$AUTH_KEYS"
   ok "Ansible public key added to ${AUTH_KEYS}"
 fi
-ok "Ansible key stored: ${ANSIBLE_PUBKEY_FILE}"
 
 # =============================================================================
 # 7. Park configuration — interactive, writes .env
-# Skipped on re-run if .env already exists.
 # =============================================================================
 header "Park Configuration"
 
@@ -291,10 +245,19 @@ else
   prompt_default EXTERNAL_NIC_INTERFACE "Corporate/external NIC"      "ens19"
 
   echo ""
+  info "Ansible VM — the management UI uses this to deploy edge nodes"
+  echo "  Leave blank if you do not have an Ansible VM yet."
+  echo "  You can set ANSIBLE_VM_HOST in ${ENV_FILE} later."
+  prompt_default ANSIBLE_VM_HOST "Ansible VM dept-NIC IP" ""
+
+  echo ""
   info "Optional: weather and alerting (leave blank to configure later)"
-  prompt_default WEATHER_API_KEY "" ""
-  prompt_default WEATHER_ZIP     "Weather ZIP code" ""
-  prompt_default ALERT_EMAIL     "Alert email address" ""
+  prompt_default WEATHER_ZIP  "Weather ZIP code"    ""
+  prompt_default ALERT_EMAIL  "Alert email address" ""
+
+  # Derive dept NIC IP for ANSIBLE_VM_KEY_PATH reference
+  DEPT_NIC_IP_NOW=$(ip -4 addr show dev "${DEPT_NIC_INTERFACE}" 2>/dev/null \
+    | awk '/inet /{split($2,a,"/"); print a[1]}' | head -1 || true)
 
   cat > "$ENV_FILE" << EOF
 # =============================================================================
@@ -317,11 +280,19 @@ API_KEY=${API_KEY}
 SERVER_BOOTSTRAP_TOKEN=${SERVER_BOOTSTRAP_TOKEN}
 
 DEPT_NIC_INTERFACE=${DEPT_NIC_INTERFACE}
+DEPT_NIC_IP=${DEPT_NIC_IP_NOW}
 EXTERNAL_NIC_INTERFACE=${EXTERNAL_NIC_INTERFACE}
 
 ANSIBLE_PUBKEY_PATH=${ANSIBLE_PUBKEY_FILE}
 
-WEATHER_API_KEY=${WEATHER_API_KEY:-}
+# Ansible VM — used by the management UI to deploy edge nodes remotely
+# Set to the Ansible VM's dept-NIC IP address after running ansible.sh there.
+ANSIBLE_VM_HOST=${ANSIBLE_VM_HOST:-}
+ANSIBLE_VM_USER=ridestatus
+ANSIBLE_VM_KEY=${ANSIBLE_PUBKEY_FILE%%.pub}
+ANSIBLE_INVENTORY_DIR=/home/ridestatus/inventory
+ANSIBLE_DEPLOY_DIR=/home/ridestatus/ridestatus-deploy
+
 WEATHER_ZIP=${WEATHER_ZIP:-}
 WEATHER_POLL_INTERVAL_S=60
 
@@ -346,11 +317,7 @@ EOF
 fi
 
 # =============================================================================
-# 8. Chrony — configured AFTER park config so we know DEPT_NIC_INTERFACE
-#
-# Derives the actual dept subnet from the NIC's IP address and prefix length,
-# scoping the chrony 'allow' directive precisely. Falls back to 10.0.0.0/8
-# if the NIC isn't up yet (shouldn't happen — cloud-init configured it).
+# 8. Chrony
 # =============================================================================
 header "Configuring NTP (chrony)"
 
@@ -358,28 +325,17 @@ DEPT_SUBNET=$(dept_nic_subnet "${DEPT_NIC_INTERFACE:-ens18}" || true)
 
 if [[ -z "$DEPT_SUBNET" ]]; then
   warn "Could not determine subnet for ${DEPT_NIC_INTERFACE} — using 10.0.0.0/8 fallback"
-  warn "Edit /etc/chrony/chrony.conf 'allow' line to match your actual dept subnet"
   DEPT_SUBNET="10.0.0.0/8"
 else
-  ok "Dept NIC subnet: ${DEPT_SUBNET} (chrony will allow NTP from this range)"
+  ok "Dept NIC subnet: ${DEPT_SUBNET}"
 fi
 
 cat > /etc/chrony/chrony.conf << EOF
 # RideStatus Aggregation Server — chrony config
 # Generated by server.sh — $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-#
-# Syncs from internet NTP pool (stratum 2).
-# Edge nodes on the dept network sync from this VM (stratum 3).
-# Dept subnet (${DEPT_NIC_INTERFACE}): ${DEPT_SUBNET}
-
 pool pool.ntp.org iburst minpoll 6 maxpoll 10
-
-# Allow NTP clients on the dept/RideStatus network only
 allow ${DEPT_SUBNET}
-
-# Serve time even if not yet synced (edge nodes may boot before we do)
 local stratum 3
-
 makestep 1.0 3
 rtcsync
 driftfile /var/lib/chrony/drift
@@ -430,17 +386,14 @@ else
   ok "Repo cloned to ${APP_DIR}"
 fi
 
-info "Installing npm dependencies..."
 sudo -u "$RS_USER" bash -c "cd ${APP_DIR} && npm ci --omit=dev --silent"
 ok "npm dependencies installed"
 
 ln -sf "$ENV_FILE" "${APP_DIR}/.env"
 chown -h "${RS_USER}:${RS_USER}" "${APP_DIR}/.env"
-
 mkdir -p "$LOG_DIR"
 chown "${RS_USER}:${RS_USER}" "$LOG_DIR"
 
-info "Running database migrations..."
 sudo -u "$RS_USER" bash -c "cd ${APP_DIR} && node db/migrate.js" \
   && ok "Migrations complete" \
   || die "Migration failed — check ${LOG_DIR}/server-err.log"
@@ -457,8 +410,7 @@ else
   info "PM2 already installed ($(pm2 --version))"
 fi
 
-if sudo -u "$RS_USER" pm2 describe ridestatus-server &>/dev/null; then
-  info "PM2 process exists — reloading"
+if sudo -u "$RS_USER" pm2 describe rs-server &>/dev/null; then
   sudo -u "$RS_USER" bash -c "cd ${APP_DIR} && pm2 reload ecosystem.config.js"
 else
   sudo -u "$RS_USER" bash -c "cd ${APP_DIR} && pm2 start ecosystem.config.js"
@@ -466,59 +418,58 @@ else
 fi
 
 sudo -u "$RS_USER" pm2 save
-
-pm2 startup systemd -u "$RS_USER" --hp "$RS_HOME" \
-  | tail -n 1 | bash 2>/dev/null || true
+pm2 startup systemd -u "$RS_USER" --hp "$RS_HOME" | tail -n 1 | bash 2>/dev/null || true
 systemctl enable "pm2-${RS_USER}" 2>/dev/null || true
-
 ok "PM2 startup configured"
 
 # =============================================================================
 # 12. UFW firewall
-# NTP (123/udp) is scoped to the dept subnet — same subnet chrony allows.
 # =============================================================================
 header "Configuring Firewall"
 
 ufw --force reset >/dev/null
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow ssh                                            comment "Admin SSH"
-ufw allow "${API_PORT:-3100}/tcp"                       comment "RideStatus API"
-ufw allow 3000/tcp                                       comment "RideStatus board UI"
+ufw allow ssh                                           comment "Admin SSH"
+ufw allow "${API_PORT:-3100}/tcp"                      comment "RideStatus API + UI"
 ufw allow from "${DEPT_SUBNET}" to any port 123 proto udp \
-                                                         comment "NTP — dept network only"
+                                                        comment "NTP — dept network only"
 ufw --force enable
 
-ok "Firewall configured (NTP restricted to ${DEPT_SUBNET})"
+ok "Firewall configured"
 
 # =============================================================================
 # Done
 # =============================================================================
 header "Server Bootstrap Complete"
 
+SERVER_IP=$(ip -4 addr show dev "${DEPT_NIC_INTERFACE:-ens18}" \
+  | grep -o 'inet [0-9.]*' | awk '{print $2}' || echo "<server-ip>")
+
 ok "Node.js:      $(node --version)"
 ok "PostgreSQL:   $(psql --version | awk '{print $3}')"
 ok "PM2:          $(pm2 --version)"
-ok "Dept subnet:  ${DEPT_SUBNET}"
-ok "App:          ${APP_DIR}"
-ok "Config:       ${ENV_FILE}"
-ok "Ansible key:  ${ANSIBLE_PUBKEY_FILE}"
-ok "Logs:         ${LOG_DIR}"
 
 echo ""
 echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════╗${RESET}"
-echo -e "${BOLD}${GREEN}║              RideStatus Server Ready                        ║${RESET}"
+echo -e "${BOLD}${GREEN}║              RideStatus Server Ready                         ║${RESET}"
 echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════╣${RESET}"
 echo -e "${BOLD}${GREEN}║                                                              ║${RESET}"
-printf "${BOLD}${GREEN}║  API:              http://%-36s║${RESET}\n" \
-  "$(ip -4 addr show dev "${DEPT_NIC_INTERFACE:-ens18}" | grep -o 'inet [0-9.]*' | awk '{print $2}'):${API_PORT:-3100}"
-printf "${BOLD}${GREEN}║  Board UI:         http://%-36s║${RESET}\n" \
-  "$(ip -4 addr show dev "${DEPT_NIC_INTERFACE:-ens18}" | grep -o 'inet [0-9.]*' | awk '{print $2}'):3000"
+printf  "${BOLD}${GREEN}║  Main board:   http://%-39s║${RESET}\n" "${SERVER_IP}:${API_PORT:-3100}/"
+printf  "${BOLD}${GREEN}║  Management:   http://%-39s║${RESET}\n" "${SERVER_IP}:${API_PORT:-3100}/manage"
+echo -e "${BOLD}${GREEN}║                                                              ║${RESET}"
 echo -e "${BOLD}${GREEN}║  Enrollment token: ${SERVER_BOOTSTRAP_TOKEN}$(printf '%*s' $((44 - ${#SERVER_BOOTSTRAP_TOKEN})) '')║${RESET}"
 echo -e "${BOLD}${GREEN}║  Dept NTP subnet:  ${DEPT_SUBNET}$(printf '%*s' $((44 - ${#DEPT_SUBNET})) '')║${RESET}"
+if [[ -n "${ANSIBLE_VM_HOST:-}" ]]; then
+echo -e "${BOLD}${GREEN}║  Ansible VM:       ${ANSIBLE_VM_HOST}$(printf '%*s' $((44 - ${#ANSIBLE_VM_HOST})) '')║${RESET}"
+else
+echo -e "${BOLD}${YELLOW}║  Ansible VM:       not set — add ANSIBLE_VM_HOST to .env    ║${RESET}"
+fi
 echo -e "${BOLD}${GREEN}║                                                              ║${RESET}"
-echo -e "${BOLD}${GREEN}║  Next: run bootstrap/edge-init.sh on each ride edge node    ║${RESET}"
+echo -e "${BOLD}${GREEN}║  Next steps:                                                 ║${RESET}"
+echo -e "${BOLD}${GREEN}║  1. Run edge-init.sh on each edge node                       ║${RESET}"
+echo -e "${BOLD}${GREEN}║  2. Open /manage to add rides and trigger deploys             ║${RESET}"
 echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════╝${RESET}"
 echo ""
 info "PM2 status: sudo -u ridestatus pm2 status"
-info "App logs:   sudo -u ridestatus pm2 logs ridestatus-server"
+info "App logs:   sudo -u ridestatus pm2 logs rs-server"
