@@ -8,18 +8,17 @@
 #
 # What this script does:
 #   1. Installs system packages (Ansible, chrony, git, curl, jq)
-#   2. Configures chrony to sync from internet NTP pool (stratum 2,
-#      independent of the RideStatus Server VM)
+#   2. Configures chrony to sync from internet NTP pool (stratum 2)
 #   3. Ensures the 'ridestatus' OS user exists with correct home/permissions
 #   4. Generates the Ansible SSH keypair used to manage all nodes
 #      (/home/ridestatus/.ssh/ansible_ridestatus)
-#   5. Clones ridestatus-deploy repo to /home/ridestatus/ridestatus-deploy
-#   6. Writes a starter Ansible inventory
-#   7. Installs a systemd timer for the health-check playbook (every 5 min)
-#   8. Starts a one-shot HTTP key server on port 9876 (dept NIC) so that
-#      server.sh can fetch the Ansible public key automatically — no
-#      copy-paste required, even across two physical hosts.
-#      The server exits after one successful fetch or after 10 minutes.
+#   5. Configures GitHub access so Ansible can clone private repos
+#      on edge nodes (deploy key or PAT — tech chooses)
+#   6. Clones ridestatus-deploy repo to /home/ridestatus/ridestatus-deploy
+#   7. Writes a starter Ansible inventory
+#   8. Installs a systemd timer for the health-check playbook (every 5 min)
+#   9. Starts a one-shot HTTP key server on port 9876 so that server.sh
+#      can fetch the Ansible public key automatically.
 #
 # Usage (called by deploy.sh via SSH, or manually):
 #   curl -fsSL https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap/ansible.sh | sudo bash
@@ -43,10 +42,14 @@ RS_HOME="/home/${RS_USER}"
 DEPLOY_REPO="https://github.com/RideStatus/ridestatus-deploy.git"
 DEPLOY_DIR="${RS_HOME}/ridestatus-deploy"
 ANSIBLE_KEY="${RS_HOME}/.ssh/ansible_ridestatus"
+GITHUB_KEY="${RS_HOME}/.ssh/github_deploy"
 INVENTORY_DIR="${RS_HOME}/inventory"
 LOG_DIR="${RS_HOME}/logs"
 KEY_SERVER_PORT=9876
 KEY_SERVER_TIMEOUT=600  # 10 minutes
+
+# Private repos that Ansible needs to clone onto edge nodes
+PRIVATE_REPOS=("git@github.com:RideStatus/ridestatus-ride.git")
 
 # =============================================================================
 # 1. System packages
@@ -115,8 +118,6 @@ ok "Home directory ready: ${RS_HOME}"
 
 # =============================================================================
 # 4. Ansible SSH keypair
-# Generated once — never rotated automatically.
-# To rotate: rm the key files and re-run.
 # =============================================================================
 header "Ansible SSH Keypair"
 
@@ -132,7 +133,183 @@ else
 fi
 
 # =============================================================================
-# 5. Clone ridestatus-deploy repo
+# 5. GitHub access — deploy key or PAT
+#
+# Ansible needs to clone private RideStatus repos onto edge nodes.
+# Two options:
+#   A) Deploy key — SSH keypair; public key added once to each private repo
+#      in GitHub (Settings → Deploy keys). Most secure. Recommended.
+#   B) Personal access token (PAT) — simpler, works immediately, but tied
+#      to a user account. Stored as a git credential.
+#
+# On re-run: if credentials already configured, this section is skipped.
+# =============================================================================
+header "GitHub Access for Private Repos"
+
+GITHUB_CREDS_CONFIGURED=false
+
+# Check if already configured
+if [[ -f "${GITHUB_KEY}" ]] || sudo -u "$RS_USER" git credential fill <<< "protocol=https
+host=github.com" 2>/dev/null | grep -q 'password='; then
+  info "GitHub credentials already configured — skipping"
+  GITHUB_CREDS_CONFIGURED=true
+fi
+
+if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
+  echo ""
+  echo -e "${BOLD}GitHub access is needed so Ansible can clone private repos onto edge nodes.${RESET}"
+  echo ""
+  echo "  1) Deploy key  (recommended — SSH key scoped to RideStatus repos)"
+  echo "  2) Access token (PAT — simpler, enter once, done)"
+  echo ""
+
+  GITHUB_AUTH_METHOD=""
+  while true; do
+    read -rp "$(echo -e "${BOLD}Choose [1]: ${RESET}")" GITHUB_AUTH_METHOD
+    GITHUB_AUTH_METHOD=${GITHUB_AUTH_METHOD:-1}
+    [[ "$GITHUB_AUTH_METHOD" =~ ^[12]$ ]] && break
+    warn "Enter 1 or 2."
+  done
+
+  if [[ "$GITHUB_AUTH_METHOD" == "1" ]]; then
+    # --- Deploy key ---
+    echo ""
+    if [[ -f "${GITHUB_KEY}" ]]; then
+      info "GitHub deploy key already exists at ${GITHUB_KEY}"
+    else
+      sudo -u "$RS_USER" ssh-keygen \
+        -t ed25519 -f "${GITHUB_KEY}" -N "" -C "ridestatus-ansible-deploy" -q
+      chmod 600 "${GITHUB_KEY}"
+      chmod 644 "${GITHUB_KEY}.pub"
+      ok "GitHub deploy key generated: ${GITHUB_KEY}"
+    fi
+
+    echo ""
+    echo -e "${BOLD}${YELLOW}Action required — add this deploy key to each private repo in GitHub:${RESET}"
+    echo ""
+    echo -e "${BOLD}  Public key to add:${RESET}"
+    echo ""
+    cat "${GITHUB_KEY}.pub"
+    echo ""
+    echo -e "${BOLD}  Add it here (read-only, no write access needed):${RESET}"
+    for repo in "${PRIVATE_REPOS[@]}"; do
+      repo_name=$(basename "$repo" .git)
+      echo "    https://github.com/RideStatus/${repo_name}/settings/keys"
+    done
+    echo ""
+    echo -e "${BOLD}  Steps: Settings → Deploy keys → Add deploy key → paste key → Allow write access: NO${RESET}"
+    echo ""
+
+    # Wait for the tech to add the key before testing
+    read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")"
+
+    # Configure SSH to use this key for github.com
+    SSH_CONFIG="${RS_HOME}/.ssh/config"
+    if ! grep -q "Host github.com" "$SSH_CONFIG" 2>/dev/null; then
+      cat >> "$SSH_CONFIG" << EOF
+
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ${GITHUB_KEY}
+  StrictHostKeyChecking no
+  IdentitiesOnly yes
+EOF
+      chmod 600 "$SSH_CONFIG"
+      chown "${RS_USER}:${RS_USER}" "$SSH_CONFIG"
+      ok "SSH config updated for github.com"
+    else
+      info "SSH config for github.com already present"
+    fi
+
+    # Test access
+    echo ""
+    info "Testing GitHub deploy key access..."
+    TEST_PASS=true
+    for repo in "${PRIVATE_REPOS[@]}"; do
+      repo_name=$(basename "$repo" .git)
+      if sudo -u "$RS_USER" ssh -i "${GITHUB_KEY}" \
+          -o StrictHostKeyChecking=no \
+          -o BatchMode=yes \
+          git@github.com 2>&1 | grep -q "successfully authenticated"; then
+        ok "  ✓ ${repo_name} — access confirmed"
+      else
+        # Try git ls-remote as a more reliable test
+        if sudo -u "$RS_USER" git ls-remote "$repo" HEAD &>/dev/null; then
+          ok "  ✓ ${repo_name} — access confirmed"
+        else
+          warn "  ✗ ${repo_name} — could not verify access"
+          warn "    Check that the deploy key was added to: https://github.com/RideStatus/${repo_name}/settings/keys"
+          TEST_PASS=false
+        fi
+      fi
+    done
+
+    if [[ "$TEST_PASS" == "false" ]]; then
+      warn "One or more repos could not be verified. Ansible deploys may fail."
+      warn "You can re-run ansible.sh to retry, or add the key manually."
+    else
+      ok "All private repos accessible"
+    fi
+
+  else
+    # --- Personal access token ---
+    echo ""
+    echo -e "${BOLD}Create a PAT at: https://github.com/settings/tokens${RESET}"
+    echo "  Token type: Classic"
+    echo "  Scopes needed: repo (read-only is sufficient)"
+    echo ""
+    read -rp "$(echo -e "${BOLD}GitHub username: ${RESET}")" GITHUB_USER
+    read -rsp "$(echo -e "${BOLD}GitHub PAT (input hidden): ${RESET}")" GITHUB_PAT
+    echo ""
+
+    if [[ -z "$GITHUB_USER" || -z "$GITHUB_PAT" ]]; then
+      warn "Username or PAT was empty — skipping GitHub credential storage"
+      warn "Ansible deploys to edge nodes will fail until credentials are configured"
+      warn "Re-run ansible.sh to configure credentials"
+    else
+      # Store credential using git credential store
+      sudo -u "$RS_USER" git config --global credential.helper store
+      echo "https://${GITHUB_USER}:${GITHUB_PAT}@github.com" \
+        > "${RS_HOME}/.git-credentials"
+      chmod 600 "${RS_HOME}/.git-credentials"
+      chown "${RS_USER}:${RS_USER}" "${RS_HOME}/.git-credentials"
+
+      # Test access
+      echo ""
+      info "Testing PAT access..."
+      TEST_PASS=true
+      for repo in "${PRIVATE_REPOS[@]}"; do
+        # Convert SSH URL to HTTPS for PAT auth
+        https_url="https://github.com/RideStatus/$(basename "$repo" .git).git"
+        if sudo -u "$RS_USER" git ls-remote "$https_url" HEAD &>/dev/null; then
+          ok "  ✓ $(basename "$repo" .git) — access confirmed"
+        else
+          warn "  ✗ $(basename "$repo" .git) — could not verify — check PAT scopes"
+          TEST_PASS=false
+        fi
+      done
+
+      if [[ "$TEST_PASS" == "false" ]]; then
+        warn "One or more repos could not be verified."
+        warn "Ensure the PAT has 'repo' scope and access to the RideStatus org."
+      else
+        ok "All private repos accessible via PAT"
+      fi
+
+      # Update group_vars so Ansible uses HTTPS URLs when PAT is configured
+      # (deploy key uses SSH URLs, already set in group_vars/all.yml)
+      GV_ALL="${DEPLOY_DIR}/ansible/group_vars/all.yml"
+      if [[ -f "$GV_ALL" ]] && grep -q 'ridestatus_ride_repo:' "$GV_ALL"; then
+        sed -i "s|ridestatus_ride_repo:.*|ridestatus_ride_repo: https://github.com/RideStatus/ridestatus-ride.git|" "$GV_ALL"
+        ok "group_vars/all.yml updated to use HTTPS repo URLs for PAT auth"
+      fi
+    fi
+  fi
+fi
+
+# =============================================================================
+# 6. Clone ridestatus-deploy repo
 # =============================================================================
 header "Cloning ridestatus-deploy"
 
@@ -145,7 +322,7 @@ else
 fi
 
 # =============================================================================
-# 6. Ansible configuration and starter inventory
+# 7. Ansible configuration and starter inventory
 # =============================================================================
 header "Ansible Configuration"
 
@@ -170,7 +347,8 @@ if [[ ! -f "${INVENTORY_DIR}/hosts.yml" ]]; then
   cat > "${INVENTORY_DIR}/hosts.yml" << 'EOF'
 ---
 # RideStatus Ansible Inventory
-# Managed by bootstrap scripts and the RideStatus server admin UI.
+# Managed by the RideStatus server management UI.
+# Manual edits are preserved — the UI appends/updates entries only.
 all:
   vars:
     ansible_user: ridestatus
@@ -182,11 +360,6 @@ all:
       hosts: {}
     edge_nodes:
       hosts: {}
-      # Goliath:
-      #   ansible_host: 10.15.140.17
-      #   ride_nic_ip: 192.168.1.254
-      #   plc_ip: 192.168.1.2
-      #   plc_protocol: enip
 EOF
   chown "${RS_USER}:${RS_USER}" "${INVENTORY_DIR}/hosts.yml"
   ok "Starter inventory written"
@@ -194,8 +367,12 @@ else
   info "Inventory already exists — leaving intact"
 fi
 
+# Ensure host_vars directory exists
+mkdir -p "${INVENTORY_DIR}/host_vars"
+chown -R "${RS_USER}:${RS_USER}" "${INVENTORY_DIR}"
+
 # =============================================================================
-# 7. Systemd timer — health-check playbook every 5 minutes
+# 8. Systemd timer — health-check playbook every 5 minutes
 # =============================================================================
 header "Systemd Health-Check Timer"
 
@@ -209,7 +386,7 @@ Wants=network-online.target
 Type=oneshot
 User=${RS_USER}
 WorkingDirectory=${DEPLOY_DIR}
-ExecStart=/usr/bin/ansible-playbook ansible/playbooks/healthcheck.yml \\
+ExecStart=/usr/bin/ansible-playbook ansible/playbooks/healthcheck.yml \
   -i ${INVENTORY_DIR}/hosts.yml
 StandardOutput=append:${LOG_DIR}/healthcheck.log
 StandardError=append:${LOG_DIR}/healthcheck.log
@@ -236,48 +413,27 @@ systemctl start  ridestatus-healthcheck.timer
 ok "Health-check timer enabled (every 5 minutes)"
 
 # =============================================================================
-# 8. Ansible vault password placeholder
+# 9. Ansible vault password placeholder
 # =============================================================================
 if [[ ! -f "${RS_HOME}/.vault_pass" ]]; then
   echo '# Replace with vault password, then: chmod 600 ~/.vault_pass' \
     > "${RS_HOME}/.vault_pass"
   chmod 600 "${RS_HOME}/.vault_pass"
   chown "${RS_USER}:${RS_USER}" "${RS_HOME}/.vault_pass"
-  warn "Set vault password in ${RS_HOME}/.vault_pass before using ansible-vault"
 fi
 
 # =============================================================================
-# 9. One-shot HTTP key server
-#
-# Serves only ansible_ridestatus.pub on port KEY_SERVER_PORT.
-# Exits after the first successful GET request, or after KEY_SERVER_TIMEOUT
-# seconds, whichever comes first.
-#
-# server.sh (on any host reachable via the dept network) can fetch the key
-# automatically with:
-#   curl -fsSL http://<ansible-dept-ip>:9876/ansible_ridestatus.pub
-#
-# The server binds to all interfaces so it's reachable whether the tech
-# connects via the dept NIC or the external NIC.
-# Security: only the public key is served; the private key is never exposed.
-# The server stops itself after one fetch, limiting the exposure window.
+# 10. One-shot HTTP key server
 # =============================================================================
 header "Starting One-Shot Ansible Key Server"
 
 ANSIBLE_PUBKEY_CONTENT=$(cat "${ANSIBLE_KEY}.pub")
-
-# Determine the dept-network IP to display to the tech.
-# We look for the first non-loopback, non-link-local IPv4.
 ANSIBLE_IP=$(ip -4 addr show scope global \
   | grep -o 'inet [0-9.]*' | awk '{print $2}' | head -1 || echo "<ansible-vm-ip>")
 
-# Write the one-shot server script to a temp file so we can run it in the
-# background without relying on heredoc process substitution.
 KEY_SERVER_SCRIPT=$(mktemp /tmp/ridestatus-keyserver-XXXXXX.py)
 cat > "$KEY_SERVER_SCRIPT" << PYEOF
 import http.server
-import os
-import signal
 import threading
 
 PUBKEY_FILE = "${ANSIBLE_KEY}.pub"
@@ -285,10 +441,7 @@ PORT        = ${KEY_SERVER_PORT}
 TIMEOUT     = ${KEY_SERVER_TIMEOUT}
 
 class OneShotHandler(http.server.BaseHTTPRequestHandler):
-    served = False
-
     def log_message(self, fmt, *args):
-        # Suppress default access log noise — we print our own
         pass
 
     def do_GET(self):
@@ -308,13 +461,11 @@ class OneShotHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
         print(f'[key-server] Key fetched by {self.client_address[0]} — shutting down')
-        # Shut down in a thread so we can return the response first
         threading.Thread(target=self.server.shutdown, daemon=True).start()
 
 server = http.server.HTTPServer(('', PORT), OneShotHandler)
 server.timeout = 1
 
-# Auto-shutdown after TIMEOUT seconds even if nobody fetches the key
 def auto_shutdown():
     print(f'[key-server] Timeout reached ({TIMEOUT}s) — shutting down')
     server.shutdown()
@@ -330,21 +481,17 @@ finally:
     timer.cancel()
 PYEOF
 
-# Start the key server in the background, owned by root (reads key as root)
 python3 "$KEY_SERVER_SCRIPT" >> "${LOG_DIR}/keyserver.log" 2>&1 &
 KEY_SERVER_PID=$!
 echo "$KEY_SERVER_PID" > /tmp/ridestatus-keyserver.pid
 
-# Give it a moment to bind
 sleep 1
 if ! kill -0 "$KEY_SERVER_PID" 2>/dev/null; then
   warn "Key server failed to start — check ${LOG_DIR}/keyserver.log"
-  warn "server.sh will need the Ansible public key entered manually"
 else
   ok "Key server running (PID ${KEY_SERVER_PID})"
 fi
 
-# Cleanup on exit
 trap 'kill "$KEY_SERVER_PID" 2>/dev/null || true; rm -f "$KEY_SERVER_SCRIPT" /tmp/ridestatus-keyserver.pid' EXIT
 
 # =============================================================================
@@ -352,32 +499,28 @@ trap 'kill "$KEY_SERVER_PID" 2>/dev/null || true; rm -f "$KEY_SERVER_SCRIPT" /tm
 # =============================================================================
 header "Ansible Bootstrap Complete"
 
-ok "ridestatus-deploy cloned:  ${DEPLOY_DIR}"
-ok "Inventory:                 ${INVENTORY_DIR}/hosts.yml"
-ok "Ansible log:               ${LOG_DIR}/ansible.log"
-ok "Health-check timer:        active (every 5 min)"
+ok "ridestatus-deploy: ${DEPLOY_DIR}"
+ok "Inventory:         ${INVENTORY_DIR}/hosts.yml"
+ok "host_vars:         ${INVENTORY_DIR}/host_vars/"
+ok "Ansible log:       ${LOG_DIR}/ansible.log"
+ok "GitHub access:     configured"
 
 echo ""
 echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════════════╗${RESET}"
 echo -e "${BOLD}${YELLOW}║              Ansible Key Server Ready                        ║${RESET}"
 echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════════════╣${RESET}"
 echo -e "${BOLD}${YELLOW}║                                                              ║${RESET}"
-echo -e "${BOLD}${YELLOW}║  server.sh can fetch the Ansible public key automatically:   ║${RESET}"
+echo -e "${BOLD}${YELLOW}║  server.sh fetches the Ansible public key from:              ║${RESET}"
 echo -e "${BOLD}${YELLOW}║                                                              ║${RESET}"
-echo -e "${BOLD}${CYAN}║  URL: http://${ANSIBLE_IP}:${KEY_SERVER_PORT}/ansible_ridestatus.pub${RESET}"
+echo -e "${BOLD}${CYAN}║  http://${ANSIBLE_IP}:${KEY_SERVER_PORT}/ansible_ridestatus.pub${RESET}"
 echo -e "${BOLD}${YELLOW}║                                                              ║${RESET}"
-echo -e "${BOLD}${YELLOW}║  The server exits after one fetch or 10 minutes.             ║${RESET}"
-echo -e "${BOLD}${YELLOW}║  Public key path: ${ANSIBLE_KEY}.pub${RESET}"
+echo -e "${BOLD}${YELLOW}║  Exits after one fetch or 10 minutes.                        ║${RESET}"
 echo -e "${BOLD}${YELLOW}║                                                              ║${RESET}"
 echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════════════╝${RESET}"
 echo ""
-info "Run bootstrap/server.sh on the RideStatus Server VM now."
-info "It will fetch the key automatically if given this VM's dept IP."
-info "The key server will stop after server.sh fetches it (or in 10 min)."
+info "Run bootstrap/server.sh on the Server VM now."
+info "It will fetch the key automatically if given this VM's IP."
 
-# Keep the script alive so the key server keeps running.
-# deploy.sh SSHs in and runs this as a background pipe, so it will
-# stay up until the key server shuts itself down.
 wait "$KEY_SERVER_PID" 2>/dev/null || true
 rm -f "$KEY_SERVER_SCRIPT" /tmp/ridestatus-keyserver.pid
 ok "Key server stopped."
