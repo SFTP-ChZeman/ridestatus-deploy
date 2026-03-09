@@ -128,7 +128,7 @@ header "Detecting Network Interfaces"
 
 # Exclude:
 #   lo               — loopback
-#   vmbr*            — Proxmox Linux bridges
+#   vmbr*            — Proxmox Linux bridges (shown separately below)
 #   tap*, veth*      — VM tap/veth pairs
 #   fwbr*, fwpr*     — Proxmox firewall bridge/patch ports
 #   fwln*            — Proxmox firewall link interfaces
@@ -140,8 +140,10 @@ mapfile -t ALL_IFACES < <(
   | grep -Ev '^(vmbr|tap|veth|fwbr|fwpr|fwln)'
 )
 
+# Only show vmbr* bridges as selectable — fwbr/tap/fwpr are internal Proxmox plumbing
+# and should never be used as VM NIC bridges directly.
 mapfile -t EXISTING_BRIDGES < <(
-  brctl show 2>/dev/null | awk 'NR>1 && $1!="" {print $1}' || true
+  ip -o link show | awk -F': ' '{print $2}' | grep '^vmbr' | grep -v '@' || true
 )
 
 echo ""
@@ -153,6 +155,13 @@ for iface in "${ALL_IFACES[@]}"; do
   readlink -f "/sys/class/net/${iface}/device" 2>/dev/null | grep -q '/usb' && is_usb=" [USB]"
   echo "  ${iface}  MAC=${mac}  state=${state}${is_usb}"
 done
+
+if [[ ${#EXISTING_BRIDGES[@]} -gt 0 ]]; then
+  info "Existing Proxmox bridges:"
+  for br in "${EXISTING_BRIDGES[@]}"; do
+    echo "  ${br}"
+  done
+fi
 
 # =============================================================================
 # Enumerate USB NICs — free list keyed by USB bus path
