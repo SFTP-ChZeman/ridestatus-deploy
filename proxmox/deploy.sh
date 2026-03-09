@@ -73,6 +73,9 @@ confirm() {
   done
 }
 
+# Helper: read MAC for an interface
+iface_mac() { cat "/sys/class/net/${1}/address" 2>/dev/null || echo "unknown"; }
+
 # =============================================================================
 # Preflight
 # =============================================================================
@@ -135,7 +138,7 @@ mapfile -t EXISTING_BRIDGES < <(
 echo ""
 info "Physical interfaces found:"
 for iface in "${ALL_IFACES[@]}"; do
-  mac=$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo "unknown")
+  mac=$(iface_mac "$iface")
   state=$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo "unknown")
   is_usb=""
   readlink -f "/sys/class/net/${iface}/device" 2>/dev/null | grep -q '/usb' && is_usb=" [USB]"
@@ -159,9 +162,10 @@ done
 # =============================================================================
 header "USB NIC Detection"
 
-# Maps: iface -> vendor:product, iface -> bus path (e.g. "1-1.2")
+# Maps: iface -> vendor:product, iface -> bus path (e.g. "1-1.2"), iface -> MAC
 declare -A USB_NIC_VENDOR_PRODUCT   # iface -> "vvvv:pppp"
 declare -A USB_NIC_BUS_PATH         # iface -> "bus-port" (e.g. "1-1.2")
+declare -A USB_NIC_MAC              # iface -> MAC address
 
 # Set of bus paths claimed by existing VMs
 declare -A USB_BUS_PATH_CLAIMED_BY  # bus_path -> vmid
@@ -187,6 +191,7 @@ for iface in "${ALL_IFACES[@]}"; do
   done
   [[ -z "$vp" ]] && continue
   USB_NIC_VENDOR_PRODUCT["$iface"]="$vp"
+  USB_NIC_MAC["$iface"]=$(iface_mac "$iface")
 
   # Extract bus path from sysfs path.
   # sysfs path looks like: /sys/bus/usb/devices/1-1.2/...
@@ -248,7 +253,7 @@ for iface in "${!USB_NIC_VENDOR_PRODUCT[@]}"; do
   if [[ -z "${USB_BUS_PATH_CLAIMED_BY[$bp]:-}" ]]; then
     FREE_USB_NICS+=("$iface")
   else
-    info "USB NIC ${iface} (bus ${bp}) already claimed by VM ${USB_BUS_PATH_CLAIMED_BY[$bp]} — skipping"
+    info "USB NIC ${iface} (bus ${bp}, MAC ${USB_NIC_MAC[$iface]:-unknown}) already claimed by VM ${USB_BUS_PATH_CLAIMED_BY[$bp]} — skipping"
   fi
 done
 
@@ -259,9 +264,9 @@ elif [[ ${#FREE_USB_NICS[@]} -eq 0 ]]; then
 else
   info "Free USB NICs available:"
   for iface in "${FREE_USB_NICS[@]}"; do
-    mac=$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo "unknown")
+    mac=${USB_NIC_MAC[$iface]:-unknown}
     bp=${USB_NIC_BUS_PATH[$iface]:-unknown}
-    echo "  ${iface}  MAC=${mac}  vendor:product=${USB_NIC_VENDOR_PRODUCT[$iface]}  bus=${bp}"
+    echo "  ${iface}  MAC=${mac}  bus=${bp}  vendor:product=${USB_NIC_VENDOR_PRODUCT[$iface]}"
   done
 fi
 
@@ -296,7 +301,7 @@ declare -A BRIDGE_IFACE_MAP
 configure_vm_nics() {
   local vm_label=$1
   VM_NICS_TYPE=(); VM_NICS_LABEL=(); VM_NICS_BRIDGE=()
-  VM_NICS_USB=();  VM_NICS_IP=();   VM_NICS_GW=(); VM_NICS_DNS=()
+  VM_NICS_USB=();  VM_NICS_MAC=();   VM_NICS_IP=(); VM_NICS_GW=(); VM_NICS_DNS=()
 
   local nic_num=1
   while true; do
@@ -322,7 +327,7 @@ configure_vm_nics() {
     local method_idx=0
     pick_menu method_idx "How should vNIC${nic_num} connect?" "${method_opts[@]}"
 
-    local nic_type="" bridge_name="" usb_iface="" ip_cidr="" gw="" dns=""
+    local nic_type="" bridge_name="" usb_iface="" nic_mac="" ip_cidr="" gw="" dns=""
 
     if [[ $method_idx -eq 0 ]]; then
       nic_type="bridge"
@@ -341,31 +346,37 @@ configure_vm_nics() {
         while ip link show "vmbr${next_num}" &>/dev/null 2>&1; do (( next_num++ )); done
         prompt_default bridge_name "New bridge name" "vmbr${next_num}"
         echo "Available physical interfaces:"
-        for iface in "${ALL_IFACES[@]}"; do echo "  ${iface}"; done
+        for iface in "${ALL_IFACES[@]}"; do
+          echo "  ${iface}  MAC=$(iface_mac "$iface")"
+        done
         local onboard_iface
         prompt_required onboard_iface "Physical NIC to attach to ${bridge_name}"
         BRIDGE_IFACE_MAP["$bridge_name"]="$onboard_iface"
         EXISTING_BRIDGES+=("$bridge_name")
       fi
+      # MAC not meaningful for bridged NICs (VM gets a virtio-generated MAC)
+      nic_mac="virtio-generated"
 
     else
       nic_type="usb"
       if [[ ${#available_usb[@]} -eq 1 ]]; then
         usb_iface=${available_usb[0]}
-        info "Using only available free USB NIC: ${usb_iface}"
+        nic_mac=${USB_NIC_MAC[$usb_iface]:-unknown}
+        info "Using only available free USB NIC: ${usb_iface}  MAC=${nic_mac}  bus=${USB_NIC_BUS_PATH[$usb_iface]:-unknown}"
       else
         local usb_opts=()
         for u in "${available_usb[@]}"; do
-          local mac; mac=$(cat "/sys/class/net/${u}/address" 2>/dev/null || echo "unknown")
+          local mac=${USB_NIC_MAC[$u]:-unknown}
           local bp=${USB_NIC_BUS_PATH[$u]:-unknown}
           usb_opts+=("${u}  MAC=${mac}  bus=${bp}  (${USB_NIC_VENDOR_PRODUCT[$u]})")
         done
         local usb_idx=0
         pick_menu usb_idx "Which USB NIC?" "${usb_opts[@]}"
         usb_iface=${available_usb[$usb_idx]}
+        nic_mac=${USB_NIC_MAC[$usb_iface]:-unknown}
       fi
       SESSION_CLAIMED_USB+=("$usb_iface")
-      ok "Reserved ${usb_iface} (bus ${USB_NIC_BUS_PATH[$usb_iface]:-unknown}) for ${vm_label} vNIC${nic_num}"
+      ok "Reserved ${usb_iface}  MAC=${nic_mac}  bus=${USB_NIC_BUS_PATH[$usb_iface]:-unknown}  for ${vm_label} vNIC${nic_num}"
     fi
 
     prompt_required ip_cidr \
@@ -379,6 +390,7 @@ configure_vm_nics() {
 
     VM_NICS_TYPE+=("$nic_type"); VM_NICS_LABEL+=("$net_label")
     VM_NICS_BRIDGE+=("$bridge_name"); VM_NICS_USB+=("$usb_iface")
+    VM_NICS_MAC+=("$nic_mac")
     VM_NICS_IP+=("$ip_cidr"); VM_NICS_GW+=("$gw"); VM_NICS_DNS+=("$dns")
 
     (( nic_num++ ))
@@ -394,6 +406,7 @@ if $CREATE_SERVER; then
   configure_vm_nics "Server VM"
   SERVER_NICS_TYPE=("${VM_NICS_TYPE[@]}");   SERVER_NICS_LABEL=("${VM_NICS_LABEL[@]}")
   SERVER_NICS_BRIDGE=("${VM_NICS_BRIDGE[@]}"); SERVER_NICS_USB=("${VM_NICS_USB[@]}")
+  SERVER_NICS_MAC=("${VM_NICS_MAC[@]}")
   SERVER_NICS_IP=("${VM_NICS_IP[@]}");         SERVER_NICS_GW=("${VM_NICS_GW[@]}")
   SERVER_NICS_DNS=("${VM_NICS_DNS[@]}")
 fi
@@ -403,6 +416,7 @@ if $CREATE_ANSIBLE; then
   configure_vm_nics "Ansible VM"
   ANSIBLE_NICS_TYPE=("${VM_NICS_TYPE[@]}");   ANSIBLE_NICS_LABEL=("${VM_NICS_LABEL[@]}")
   ANSIBLE_NICS_BRIDGE=("${VM_NICS_BRIDGE[@]}"); ANSIBLE_NICS_USB=("${VM_NICS_USB[@]}")
+  ANSIBLE_NICS_MAC=("${VM_NICS_MAC[@]}")
   ANSIBLE_NICS_IP=("${VM_NICS_IP[@]}");         ANSIBLE_NICS_GW=("${VM_NICS_GW[@]}")
   ANSIBLE_NICS_DNS=("${VM_NICS_DNS[@]}")
 fi
@@ -465,16 +479,16 @@ header "Summary — Review Before Proceeding"
 
 print_vm_summary() {
   local label=$1 vmid=$2 hostname=$3 ram=$4 cores=$5 disk=$6
-  local -n _nt=$7 _nl=$8 _nb=$9 _nu=${10} _ni=${11} _ng=${12}
+  local -n _nt=$7 _nl=$8 _nb=$9 _nu=${10} _nm=${11} _ni=${12} _ng=${13}
   echo -e "  ${BOLD}${label}${RESET}"
   echo "    VM ID: ${vmid}  Hostname: ${hostname}  RAM: ${ram}GB  Cores: ${cores}  Disk: ${disk}GB"
   for i in "${!_nt[@]}"; do
     local conn=""
     if [[ "${_nt[$i]}" == "bridge" ]]; then
-      conn="bridge=${_nb[$i]}"
+      conn="bridge=${_nb[$i]}  MAC=${_nm[$i]}"
     else
       local bp=${USB_NIC_BUS_PATH[${_nu[$i]}]:-unknown}
-      conn="USB passthrough=${_nu[$i]} bus=${bp} (${USB_NIC_VENDOR_PRODUCT[${_nu[$i]}]:-unknown})"
+      conn="USB passthrough=${_nu[$i]}  MAC=${_nm[$i]}  bus=${bp}"
     fi
     local gw_str=""; [[ -n "${_ng[$i]:-}" ]] && gw_str="  GW=${_ng[$i]}"
     echo "    vNIC$((i+1)): ${_nl[$i]}  IP=${_ni[$i]}${gw_str}  [${conn}]"
@@ -485,12 +499,12 @@ echo ""
 $CREATE_SERVER  && print_vm_summary "RideStatus Server" "$SERVER_VMID" "$SERVER_HOST" \
   "$SERVER_RAM" "$SERVER_CORES" "$SERVER_DISK" \
   SERVER_NICS_TYPE SERVER_NICS_LABEL SERVER_NICS_BRIDGE \
-  SERVER_NICS_USB  SERVER_NICS_IP    SERVER_NICS_GW
+  SERVER_NICS_USB  SERVER_NICS_MAC   SERVER_NICS_IP SERVER_NICS_GW
 echo ""
 $CREATE_ANSIBLE && print_vm_summary "Ansible Controller" "$ANSIBLE_VMID" "$ANSIBLE_HOST" \
   "$ANSIBLE_RAM" "$ANSIBLE_CORES" "$ANSIBLE_DISK" \
   ANSIBLE_NICS_TYPE ANSIBLE_NICS_LABEL ANSIBLE_NICS_BRIDGE \
-  ANSIBLE_NICS_USB  ANSIBLE_NICS_IP    ANSIBLE_NICS_GW
+  ANSIBLE_NICS_USB  ANSIBLE_NICS_MAC   ANSIBLE_NICS_IP ANSIBLE_NICS_GW
 
 echo ""
 warn "This will create VMs and modify Proxmox network configuration."
@@ -625,7 +639,7 @@ create_vm() {
         warn "Bus path unavailable for ${host_iface} — falling back to host=${vp} (may be ambiguous)"
         qm set "$vmid" --usb${usb_slot} "host=${vp}"
       else
-        info "Assigning USB NIC ${host_iface} to VM ${vmid} via bus path host=${bp}"
+        info "Assigning USB NIC ${host_iface} (MAC ${USB_NIC_MAC[$host_iface]:-unknown}) to VM ${vmid} via bus path host=${bp}"
         qm set "$vmid" --usb${usb_slot} "host=${bp}"
       fi
       (( usb_slot++ ))
@@ -690,15 +704,14 @@ fix_usb_nic_names() {
   for i in "${!fnn_type[@]}"; do
     [[ "${fnn_type[$i]}" != "usb" ]] && continue
     local host_iface=${fnn_usb[$i]}
-    local host_mac; host_mac=$(cat "/sys/class/net/${host_iface}/address" 2>/dev/null \
-                               | tr '[:upper:]' '[:lower:]' || echo "")
+    local host_mac; host_mac=$(iface_mac "$host_iface" | tr '[:upper:]' '[:lower:]')
     local real_name=${GA_MAC_TO_NAME[$host_mac]:-}
     local placeholder="usb-placeholder-${usb_slot}"
 
     if [[ -z "$real_name" ]]; then
       warn "No guest NIC matched MAC ${host_mac} — ${placeholder} may need manual fix"
     elif [[ "$real_name" != "$placeholder" ]]; then
-      info "USB NIC ${host_iface} is '${real_name}' inside VM (was placeholder '${placeholder}')"
+      info "USB NIC ${host_iface} (MAC ${host_mac}) is '${real_name}' inside VM (was placeholder '${placeholder}')"
       USB_REAL_NAME["$placeholder"]="$real_name"
       needs_fix=true
     fi
