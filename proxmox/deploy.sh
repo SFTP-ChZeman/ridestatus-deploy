@@ -11,6 +11,11 @@
 #   cloud-init alongside the tech's admin key. The script uses the temp key
 #   exclusively for bootstrap SSH connections, then deletes it on exit.
 #
+# Cloud-init approach:
+#   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig)
+#   which work on any Proxmox storage. Does NOT require snippets content type.
+#   Packages and runcmd are handled by the bootstrap scripts after first boot.
+#
 # USB NIC naming:
 #   After each VM boots, the QEMU guest agent is queried for real NIC names.
 #   Any USB passthrough NIC netplan placeholders are patched in-place.
@@ -106,8 +111,7 @@ ok "Temporary deploy keypair generated (deleted on exit)"
 
 cleanup() {
   rm -rf "$DEPLOY_KEY_DIR"
-  rm -f /var/lib/vz/snippets/vm-*-user.yaml \
-        /var/lib/vz/snippets/vm-*-net.yaml 2>/dev/null || true
+  rm -f /tmp/ridestatus-sshkeys-*.txt 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -165,27 +169,13 @@ fi
 
 # =============================================================================
 # Enumerate USB NICs — free list keyed by USB bus path
-#
-# USB NICs are identified by their sysfs bus path (e.g. "1-1.2"), not by
-# vendor:product ID. This ensures two identical USB NICs (same make/model)
-# are treated as distinct devices and only the actually-claimed one is
-# excluded from the free list.
-#
-# Proxmox stores USB passthrough in VM config as either:
-#   host=<vendorid>:<productid>   — ambiguous when multiple identical NICs exist
-#   host=<bus>-<port>             — unambiguous, preferred
-#
-# We read both forms from existing VM configs and resolve vendor:product
-# entries back to bus paths so the claimed set is always bus-path keyed.
 # =============================================================================
 header "USB NIC Detection"
 
-# Maps: iface -> vendor:product, iface -> bus path (e.g. "1-1.2"), iface -> MAC
-# Declared before the loop so they always exist; guards ${#arr[@]} under set -u.
-declare -A USB_NIC_VENDOR_PRODUCT=()  # iface -> "vvvv:pppp"
-declare -A USB_NIC_BUS_PATH=()        # iface -> "bus-port" (e.g. "1-1.2")
-declare -A USB_NIC_MAC=()             # iface -> MAC address
-declare -A USB_BUS_PATH_CLAIMED_BY=() # bus_path -> vmid
+declare -A USB_NIC_VENDOR_PRODUCT=()
+declare -A USB_NIC_BUS_PATH=()
+declare -A USB_NIC_MAC=()
+declare -A USB_BUS_PATH_CLAIMED_BY=()
 declare -a FREE_USB_NICS=()
 
 for iface in "${ALL_IFACES[@]}"; do
@@ -193,7 +183,6 @@ for iface in "${ALL_IFACES[@]}"; do
   [[ -z "$syspath" ]] && continue
   echo "$syspath" | grep -q '/usb' || continue
 
-  # Walk up sysfs to find the USB interface directory (contains idVendor/idProduct)
   usb_dir=$(echo "$syspath" | sed 's|/[^/]*$||')
   vp=""
   while [[ "$usb_dir" =~ /usb ]]; do
@@ -209,23 +198,17 @@ for iface in "${ALL_IFACES[@]}"; do
   USB_NIC_VENDOR_PRODUCT["$iface"]="$vp"
   USB_NIC_MAC["$iface"]=$(iface_mac "$iface")
 
-  # Extract bus path from sysfs path.
-  # sysfs path looks like: /sys/bus/usb/devices/1-1.2/...
-  # The bus path component is the segment after /devices/ that matches N-N[.N]*
   bus_path=$(echo "$syspath" | grep -oP '(?<=/devices/)[\d]+-[\d.]+(?=/)' | head -1 || true)
   [[ -n "$bus_path" ]] && USB_NIC_BUS_PATH["$iface"]="$bus_path"
 done
 
-# Build claimed set from existing VMs
 if [[ ${#USB_NIC_VENDOR_PRODUCT[@]} -gt 0 ]]; then
   mapfile -t ALL_VMIDS < <(
     pvesh get "/nodes/${PROXMOX_NODE}/qemu" --output-format json 2>/dev/null \
     | grep -o '"vmid":[0-9]*' | grep -o '[0-9]*' || true
   )
 
-  # Build a lookup: vendor:product -> list of known bus paths (from this host's NICs)
-  # Used to resolve vp-style VM config entries back to bus paths.
-  declare -A VP_TO_BUS_PATHS=()  # "vvvv:pppp" -> space-separated bus paths
+  declare -A VP_TO_BUS_PATHS=()
   for iface in "${!USB_NIC_BUS_PATH[@]}"; do
     local_vp=${USB_NIC_VENDOR_PRODUCT[$iface]:-}
     local_bp=${USB_NIC_BUS_PATH[$iface]}
@@ -243,13 +226,8 @@ if [[ ${#USB_NIC_VENDOR_PRODUCT[@]} -gt 0 ]]; then
       [[ -z "$raw" ]] && continue
 
       if echo "$raw" | grep -qP '^\d+-[\d.]+$'; then
-        # Already a bus path — mark directly
         USB_BUS_PATH_CLAIMED_BY["$raw"]="$vmid"
       elif echo "$raw" | grep -qP '^[0-9a-f]{4}:[0-9a-f]{4}$'; then
-        # vendor:product form — resolve to bus paths on this host
-        # If only one NIC on this host has this vp, we know exactly which one.
-        # If multiple NICs share the vp, mark all of them as claimed to be safe
-        # (operator should use bus-path passthrough for identical NICs anyway).
         known_paths=${VP_TO_BUS_PATHS[$raw]:-}
         for bp in $known_paths; do
           USB_BUS_PATH_CLAIMED_BY["$bp"]="$vmid"
@@ -259,7 +237,6 @@ if [[ ${#USB_NIC_VENDOR_PRODUCT[@]} -gt 0 ]]; then
   done
 fi
 
-# Build free list: NICs whose bus path is not in the claimed set
 for iface in "${!USB_NIC_VENDOR_PRODUCT[@]}"; do
   bp=${USB_NIC_BUS_PATH[$iface]:-}
   if [[ -z "$bp" ]]; then
@@ -354,7 +331,6 @@ configure_vm_nics() {
       local b_idx=0
       pick_menu b_idx "Which bridge?" "${bridge_opts[@]}"
 
-      # ${#EXISTING_BRIDGES[@]} is always valid — array is always defined.
       local existing_count=${#EXISTING_BRIDGES[@]}
       if (( b_idx < existing_count )); then
         bridge_name=${EXISTING_BRIDGES[$b_idx]}
@@ -371,7 +347,6 @@ configure_vm_nics() {
         BRIDGE_IFACE_MAP["$bridge_name"]="$onboard_iface"
         EXISTING_BRIDGES+=("$bridge_name")
       fi
-      # MAC not meaningful for bridged NICs (VM gets a virtio-generated MAC)
       nic_mac="virtio-generated"
 
     else
@@ -563,7 +538,7 @@ read -rp "$(echo -e "${BOLD}Type 'yes' to proceed: ${RESET}")" final_confirm
 [[ "$final_confirm" == "yes" ]] || { echo "Aborted."; exit 0; }
 
 # =============================================================================
-# Helpers: bridge, image, cloud-init
+# Helpers: bridge, image
 # =============================================================================
 ensure_bridge() {
   local bridge=$1
@@ -598,62 +573,15 @@ ensure_ubuntu_image() {
   fi
 }
 
-build_cloud_init_userdata() {
-  local outfile=$1 hostname=$2
-  cat > "$outfile" <<EOF
-#cloud-config
-hostname: ${hostname}
-fqdn: ${hostname}
-users:
-  - name: ridestatus
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    ssh_authorized_keys:
-      - ${DEPLOY_PUBKEY_CONTENT}
-      - ${ADMIN_SSH_PUBKEY}
-package_update: true
-packages:
-  - curl
-  - git
-  - ca-certificates
-  - qemu-guest-agent
-runcmd:
-  - systemctl enable --now qemu-guest-agent
-  - mkdir -p /home/ridestatus/.ssh
-  - chown -R ridestatus:ridestatus /home/ridestatus
-EOF
-}
-
-build_cloud_init_network() {
-  local outfile=$1
-  local -n _cn_type=$2 _cn_ip=$3 _cn_gw=$4 _cn_dns=$5
-  {
-    echo "version: 2"
-    echo "ethernets:"
-    local usb_idx=0
-    for i in "${!_cn_type[@]}"; do
-      local iface_name
-      if [[ "${_cn_type[$i]}" == "bridge" ]]; then
-        iface_name="ens$((18 + i))"
-      else
-        iface_name="usb-placeholder-${usb_idx}"
-        (( usb_idx++ ))
-      fi
-      echo "  ${iface_name}:"
-      echo "    addresses: [${_cn_ip[$i]}]"
-      [[ -n "${_cn_gw[$i]:-}" ]] && echo "    gateway4: ${_cn_gw[$i]}"
-      echo "    nameservers:"
-      echo "      addresses: [${_cn_dns[$i]:-8.8.8.8}]"
-    done
-  } > "$outfile"
-}
-
 # =============================================================================
 # Helper: create and configure a VM
 #
-# USB passthrough uses host=<bus>-<port> (e.g. host=1-1.2) rather than
-# host=<vendor>:<product>. This is unambiguous when multiple NICs of the
-# same make/model are present on the host.
+# Cloud-init is applied via native qm parameters only — no snippets required.
+# SSH keys are passed via a temporary file (qm requires a file path for sshkeys).
+# Network is configured via --ipconfig which works on all storage types.
+# Packages and runcmd are handled by bootstrap scripts after first boot.
+#
+# USB passthrough uses host=<bus>-<port> (unambiguous with identical NICs).
 # =============================================================================
 create_vm() {
   local vmid=$1 hostname=$2 ram_gb=$3 cores=$4 disk_gb=$5
@@ -674,8 +602,8 @@ create_vm() {
     --scsi0 "${storage}:vm-${vmid}-disk-0,discard=on" --boot order=scsi0
   qm resize "$vmid" scsi0 "${disk_gb}G"
 
-  local bridge_nic_idx=0
-  local usb_slot=0
+  # Attach NICs
+  local bridge_nic_idx=0 usb_slot=0
   for i in "${!cv_type[@]}"; do
     if [[ "${cv_type[$i]}" == "bridge" ]]; then
       qm set "$vmid" --net${bridge_nic_idx} "virtio,bridge=${cv_bridge[$i]}"
@@ -684,32 +612,52 @@ create_vm() {
       local host_iface=${cv_usb[$i]}
       local bp=${USB_NIC_BUS_PATH[$host_iface]:-}
       if [[ -z "$bp" ]]; then
-        # Bus path unavailable — fall back to vendor:product with a warning
         local vp=${USB_NIC_VENDOR_PRODUCT[$host_iface]:-}
         [[ -z "$vp" ]] && die "Cannot find bus path or vendor:product for ${host_iface}"
         warn "Bus path unavailable for ${host_iface} — falling back to host=${vp} (may be ambiguous)"
         qm set "$vmid" --usb${usb_slot} "host=${vp}"
       else
-        info "Assigning USB NIC ${host_iface} (MAC ${USB_NIC_MAC[$host_iface]:-unknown}) to VM ${vmid} via bus path host=${bp}"
+        info "Assigning USB NIC ${host_iface} (MAC ${USB_NIC_MAC[$host_iface]:-unknown}) via host=${bp}"
         qm set "$vmid" --usb${usb_slot} "host=${bp}"
       fi
       (( usb_slot++ ))
     fi
   done
 
-  local snippets="/var/lib/vz/snippets"
-  mkdir -p "$snippets"
-  build_cloud_init_userdata "${snippets}/vm-${vmid}-user.yaml" "$hostname"
-  build_cloud_init_network  "${snippets}/vm-${vmid}-net.yaml" cv_type cv_ip cv_gw cv_dns
+  # Cloud-init: attach drive to local storage (works on all Proxmox installs)
+  qm set "$vmid" --ide2 "${storage}:cloudinit"
 
-  qm set "$vmid" --ide2 local:cloudinit \
-    --cicustom "user=local:snippets/vm-${vmid}-user.yaml,network=local:snippets/vm-${vmid}-net.yaml"
+  # SSH keys: write to a temp file (qm sshkeys requires a file path)
+  local sshkeys_file="/tmp/ridestatus-sshkeys-${vmid}.txt"
+  printf '%s\n%s\n' "$DEPLOY_PUBKEY_CONTENT" "$ADMIN_SSH_PUBKEY" > "$sshkeys_file"
+  qm set "$vmid" --ciuser ridestatus --sshkeys "$sshkeys_file"
+  rm -f "$sshkeys_file"
+
+  # Network config via ipconfig (index matches net index, i.e. bridge NICs only)
+  # USB NICs don't get ipconfig entries — their IPs are set by the bootstrap scripts
+  # which patch netplan after the guest agent identifies the real interface name.
+  local ipconfig_idx=0
+  for i in "${!cv_type[@]}"; do
+    [[ "${cv_type[$i]}" != "bridge" ]] && continue
+    local ip="${cv_ip[$i]}"
+    local gw_part=""
+    [[ -n "${cv_gw[$i]:-}" ]] && gw_part=",gw=${cv_gw[$i]}"
+    qm set "$vmid" --ipconfig${ipconfig_idx} "ip=${ip}${gw_part}"
+    (( ipconfig_idx++ ))
+  done
+
+  # DNS
+  local dns="${cv_dns[0]:-8.8.8.8}"
+  qm set "$vmid" --nameserver "$dns"
+
+  # Hostname
+  qm set "$vmid" --ciupgrade 0
 
   ok "VM ${vmid} configured"
 }
 
 # =============================================================================
-# Helper: wait for guest agent (reliable cloud-init-complete signal)
+# Helper: wait for guest agent
 # =============================================================================
 wait_for_guest_agent() {
   local vmid=$1 max_wait=${2:-300} elapsed=0
@@ -762,7 +710,7 @@ fix_usb_nic_names() {
     if [[ -z "$real_name" ]]; then
       warn "No guest NIC matched MAC ${host_mac} — ${placeholder} may need manual fix"
     elif [[ "$real_name" != "$placeholder" ]]; then
-      info "USB NIC ${host_iface} (MAC ${host_mac}) is '${real_name}' inside VM (was placeholder '${placeholder}')"
+      info "USB NIC ${host_iface} (MAC ${host_mac}) is '${real_name}' inside VM"
       USB_REAL_NAME["$placeholder"]="$real_name"
       needs_fix=true
     fi
@@ -801,11 +749,11 @@ first_ip() { local -n _fi=$1; echo "${_fi[0]%%/*}"; }
 # Helper: wait for SSH
 # =============================================================================
 wait_for_ssh() {
-  local ip=$1 max_wait=60 elapsed=0
+  local ip=$1 max_wait=120 elapsed=0
   info "Waiting for SSH on ${ip}..."
   while (( elapsed < max_wait )); do
     deploy_ssh "$ip" 'exit 0' &>/dev/null && { ok "SSH ready on ${ip}"; return 0; }
-    sleep 3; (( elapsed += 3 )); echo -n "."
+    sleep 5; (( elapsed += 5 )); echo -n "."
   done
   echo ""; die "Timed out waiting for SSH on ${ip}"
 }
@@ -834,7 +782,6 @@ run_bootstrap() {
 
 # =============================================================================
 # Helper: fetch Ansible public key from ansible.sh key server
-# Used when Server VM is on this same host (Ansible VM already bootstrapped).
 # =============================================================================
 fetch_ansible_pubkey_from_server() {
   local ansible_ip=$1
@@ -884,12 +831,10 @@ if $CREATE_ANSIBLE; then
   fix_usb_nic_names "$ANSIBLE_VMID" ANSIBLE_NICS_TYPE ANSIBLE_NICS_USB ANSIBLE_NICS_IP
   ANSIBLE_IP=$(first_ip ANSIBLE_NICS_IP)
   wait_for_ssh "$ANSIBLE_IP"
-  # Run ansible.sh in background so the key server stays up while we bootstrap server
   info "Running ansible.sh on ${ANSIBLE_IP} (key server will stay up for server.sh)..."
   deploy_ssh "$ANSIBLE_IP" \
     "curl -fsSL '${BOOTSTRAP_BASE_URL}/ansible.sh' | sudo bash" &
   ANSIBLE_BOOTSTRAP_PID=$!
-  # Give ansible.sh time to generate the key and start the key server
   info "Waiting for Ansible key server to start (30s)..."
   sleep 30
 fi
@@ -904,19 +849,16 @@ if $CREATE_SERVER; then
   ANSIBLE_PUBKEY_ENV=""
 
   if $CREATE_ANSIBLE; then
-    # Both VMs on this host — fetch key automatically
     header "Fetching Ansible Public Key Automatically"
     ANSIBLE_IP=$(first_ip ANSIBLE_NICS_IP)
     fetched_key=$(fetch_ansible_pubkey_from_server "$ANSIBLE_IP" || true)
     if [[ -n "$fetched_key" ]]; then
       ok "Ansible public key fetched automatically"
-      # Pass key to server.sh via env var so it doesn't need to prompt
       ANSIBLE_PUBKEY_ENV="ANSIBLE_PUBKEY=$(printf '%q' "$fetched_key")"
     else
       warn "Auto-fetch failed. server.sh will prompt for the key URL instead."
     fi
   else
-    # Ansible VM is on a different host — server.sh will prompt for the URL
     info "Ansible VM is on a separate host."
     info "server.sh will ask for the Ansible key server URL when it runs."
   fi
@@ -924,7 +866,7 @@ if $CREATE_SERVER; then
   run_bootstrap "$SERVER_IP" "server.sh" "$ANSIBLE_PUBKEY_ENV" || true
 fi
 
-# ---- Wait for Ansible bootstrap to finish if it's still running ------------
+# ---- Wait for Ansible bootstrap to finish ----------------------------------
 if $CREATE_ANSIBLE && [[ -n "${ANSIBLE_BOOTSTRAP_PID:-}" ]]; then
   info "Waiting for ansible.sh to complete..."
   wait "$ANSIBLE_BOOTSTRAP_PID" 2>/dev/null && ok "ansible.sh complete" \
