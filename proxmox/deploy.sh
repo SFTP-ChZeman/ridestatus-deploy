@@ -126,9 +126,18 @@ deploy_ssh() {
 # =============================================================================
 header "Detecting Network Interfaces"
 
+# Exclude:
+#   lo               — loopback
+#   vmbr*            — Proxmox Linux bridges
+#   tap*, veth*      — VM tap/veth pairs
+#   fwbr*, fwpr*     — Proxmox firewall bridge/patch ports
+#   fwln*            — Proxmox firewall link interfaces
+#   *@*              — any virtual interface with a parent (catches fwln100i0@fwpr100p0 etc.)
 mapfile -t ALL_IFACES < <(
-  ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' \
-  | grep -Ev '^(vmbr|tap|veth|fwbr|fwpr)'
+  ip -o link show | awk -F': ' '{print $2}' \
+  | grep -v '^lo$' \
+  | grep -v '@' \
+  | grep -Ev '^(vmbr|tap|veth|fwbr|fwpr|fwln)'
 )
 
 mapfile -t EXISTING_BRIDGES < <(
@@ -163,13 +172,11 @@ done
 header "USB NIC Detection"
 
 # Maps: iface -> vendor:product, iface -> bus path (e.g. "1-1.2"), iface -> MAC
-declare -A USB_NIC_VENDOR_PRODUCT   # iface -> "vvvv:pppp"
-declare -A USB_NIC_BUS_PATH         # iface -> "bus-port" (e.g. "1-1.2")
-declare -A USB_NIC_MAC              # iface -> MAC address
-
-# Set of bus paths claimed by existing VMs
-declare -A USB_BUS_PATH_CLAIMED_BY  # bus_path -> vmid
-
+# Declared before the loop so they always exist; guards ${#arr[@]} under set -u.
+declare -A USB_NIC_VENDOR_PRODUCT=()  # iface -> "vvvv:pppp"
+declare -A USB_NIC_BUS_PATH=()        # iface -> "bus-port" (e.g. "1-1.2")
+declare -A USB_NIC_MAC=()             # iface -> MAC address
+declare -A USB_BUS_PATH_CLAIMED_BY=() # bus_path -> vmid
 declare -a FREE_USB_NICS=()
 
 for iface in "${ALL_IFACES[@]}"; do
@@ -209,7 +216,7 @@ if [[ ${#USB_NIC_VENDOR_PRODUCT[@]} -gt 0 ]]; then
 
   # Build a lookup: vendor:product -> list of known bus paths (from this host's NICs)
   # Used to resolve vp-style VM config entries back to bus paths.
-  declare -A VP_TO_BUS_PATHS  # "vvvv:pppp" -> space-separated bus paths
+  declare -A VP_TO_BUS_PATHS=()  # "vvvv:pppp" -> space-separated bus paths
   for iface in "${!USB_NIC_BUS_PATH[@]}"; do
     local_vp=${USB_NIC_VENDOR_PRODUCT[$iface]:-}
     local_bp=${USB_NIC_BUS_PATH[$iface]}
@@ -293,7 +300,7 @@ $CREATE_SERVER  && info "Will create: RideStatus Server VM"
 $CREATE_ANSIBLE && info "Will create: Ansible Controller VM"
 
 declare -a SESSION_CLAIMED_USB=()
-declare -A BRIDGE_IFACE_MAP
+declare -A BRIDGE_IFACE_MAP=()
 
 # =============================================================================
 # NIC configuration helper
@@ -686,7 +693,7 @@ fix_usb_nic_names() {
   ga_json=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null || true)
   [[ -z "$ga_json" ]] && { warn "No NIC data from guest agent"; return 0; }
 
-  declare -A GA_MAC_TO_NAME
+  declare -A GA_MAC_TO_NAME=()
   while IFS= read -r line; do
     local name mac
     name=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('name',''))" 2>/dev/null || true)
@@ -699,7 +706,7 @@ fix_usb_nic_names() {
   [[ ${#GA_MAC_TO_NAME[@]} -eq 0 ]] && { warn "Guest agent returned no NIC data"; return 0; }
 
   local usb_slot=0 needs_fix=false
-  declare -A USB_REAL_NAME
+  declare -A USB_REAL_NAME=()
 
   for i in "${!fnn_type[@]}"; do
     [[ "${fnn_type[$i]}" != "usb" ]] && continue
