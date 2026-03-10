@@ -17,6 +17,8 @@
 #   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig)
 #   for user/network/keys, plus a per-VM cicustom user-data snippet written
 #   to /var/lib/vz/snippets/ that installs qemu-guest-agent on first boot.
+#   After all qm set calls are complete, `qm cloudinit update` is called to
+#   rebuild the cloud-init ISO from the current config before the VM starts.
 #   The snippet storage must have 'snippets' content enabled — this script
 #   enables it automatically if missing. pvesh JSON is used throughout for
 #   storage inspection to avoid fragile awk column parsing of pvesm output.
@@ -109,19 +111,9 @@ info "Proxmox node: ${PROXMOX_NODE}"
 
 # =============================================================================
 # Detect suitable storages for OS disk, cloud-init drive, and snippets
-#
-# OS disk    → local-lvm (LVM-thin block volumes)
-# CI drive   → directory-type storage with 'images' content enabled
-# Snippets   → directory-type storage with 'snippets' content enabled
-#              (used for cicustom user-data to install qemu-guest-agent)
-#
-# pvesh JSON is used for all storage inspection — avoids fragile awk column
-# parsing of pvesm status text output (columns vary, field 5 is a timestamp).
 # =============================================================================
 header "Detecting Storage"
 
-# get_storage_field STORAGE_NAME FIELD
-# Prints the value of FIELD for the named storage from pvesh JSON output.
 get_storage_field() {
   local name=$1 field=$2
   storage_json | python3 -c "
@@ -133,8 +125,6 @@ for s in json.load(sys.stdin):
 " 2>/dev/null || true
 }
 
-# find_dir_storage — returns name of first directory-type storage.
-# Prefers 'local'; falls back to first dir-type found.
 find_dir_storage() {
   storage_json | python3 -c "
 import sys, json
@@ -150,8 +140,6 @@ for s in stores:
 " 2>/dev/null || true
 }
 
-# ensure_content_type STORAGE_NAME CONTENT_TYPE
-# Adds CONTENT_TYPE to the storage's content list if not already present.
 ensure_content_type() {
   local storage=$1 ctype=$2
   local current_content
@@ -178,7 +166,6 @@ ensure_content_type() {
 DISK_STORAGE=""
 CI_STORAGE=""
 
-# OS disk: prefer local-lvm (LVM-thin, fast block I/O)
 if pvesm status --storage "local-lvm" &>/dev/null 2>&1; then
   DISK_STORAGE="local-lvm"
   info "OS disk storage: local-lvm"
@@ -194,7 +181,6 @@ for s in json.load(sys.stdin):
   info "OS disk storage: ${DISK_STORAGE} (local-lvm not found)"
 fi
 
-# Cloud-init ISO drive and snippets: directory-type storage
 CI_STORAGE=$(find_dir_storage)
 [[ -n "$CI_STORAGE" ]] || die "No directory-type storage found for cloud-init drive."
 ensure_content_type "$CI_STORAGE" "images"
@@ -215,8 +201,6 @@ ssh-keygen -t ed25519 -f "$DEPLOY_KEY" -N "" -C "ridestatus-deploy-temp" -q
 DEPLOY_PUBKEY_CONTENT=$(cat "$DEPLOY_PUBKEY")
 ok "Temporary deploy keypair generated (deleted on exit)"
 
-# ADMIN_KEY_PATH is set later after the admin key prompt, but we reference it
-# in deploy_ssh — declare it here so the function can use its final value.
 ADMIN_KEY_PATH="/root/ridestatus-admin-key"
 
 cleanup() {
@@ -228,8 +212,6 @@ trap cleanup EXIT
 
 # deploy_ssh IP [CMD...]
 # Tries the temporary deploy key first; falls back to the admin key.
-# This handles re-runs where the VMs already booted with a prior deploy key
-# but both keys are always injected into cloud-init authorized_keys.
 deploy_ssh() {
   local ip=$1; shift
   local ssh_opts=(
@@ -238,11 +220,9 @@ deploy_ssh() {
     -o ConnectTimeout=5
     -o BatchMode=yes
   )
-  # Try deploy key first (fast path for fresh VMs)
   if ssh -i "$DEPLOY_KEY" "${ssh_opts[@]}" "ridestatus@${ip}" "$@" 2>/dev/null; then
     return 0
   fi
-  # Fall back to admin key (handles re-runs against already-running VMs)
   if [[ -f "$ADMIN_KEY_PATH" ]]; then
     ssh -i "$ADMIN_KEY_PATH" "${ssh_opts[@]}" "ridestatus@${ip}" "$@"
     return $?
@@ -284,7 +264,7 @@ if [[ ${#EXISTING_BRIDGES[@]} -gt 0 ]]; then
 fi
 
 # =============================================================================
-# Enumerate USB NICs — free list keyed by USB bus path
+# Enumerate USB NICs
 # =============================================================================
 header "USB NIC Detection"
 
@@ -689,11 +669,6 @@ ensure_ubuntu_image() {
 
 # =============================================================================
 # Helper: write cloud-init user-data snippet for a VM
-#
-# The native qm cloud-init params (--ciuser/--sshkeys/--ipconfig) handle user
-# and network setup but do NOT install packages. We use a cicustom user-data
-# snippet to install qemu-guest-agent on first boot so the guest agent is
-# available for deploy.sh to poll after the VM starts.
 # =============================================================================
 write_userdata_snippet() {
   local vmid=$1
@@ -713,6 +688,11 @@ YAML
 
 # =============================================================================
 # Helper: create and configure a VM
+#
+# IMPORTANT: All qm set calls must complete BEFORE qm cloudinit update, which
+# rebuilds the cloud-init ISO from the current VM config. The VM is only
+# started after the ISO is up to date — otherwise cloud-init boots with a
+# stale ISO that may be missing keys, network config, or the cicustom snippet.
 #
 # NOTE: All counter increments use x=$(( x+1 )) rather than (( x++ )) because
 # under set -e, (( expr )) exits with code 1 when the expression evaluates to
@@ -737,7 +717,7 @@ create_vm() {
     --scsi0 "${DISK_STORAGE}:vm-${vmid}-disk-0,discard=on" --boot order=scsi0
   qm resize "$vmid" scsi0 "${disk_gb}G"
 
-  # Attach NICs — use x=$(( x+1 )) to avoid (( x++ )) == 0 → exit 1 under set -e
+  # Attach NICs
   local bridge_nic_idx=0 usb_slot=0
   for i in "${!cv_type[@]}"; do
     if [[ "${cv_type[$i]}" == "bridge" ]]; then
@@ -788,13 +768,18 @@ create_vm() {
   qm set "$vmid" --cicustom "user=${CI_STORAGE}:snippets/$(basename "$snippet_file")"
   info "Cloud-init user-data snippet: $(basename "$snippet_file")"
 
+  # Rebuild the cloud-init ISO from current config BEFORE starting the VM.
+  # Without this, qm uses whatever ISO was last written to disk, which may
+  # be missing keys, network config, or the cicustom snippet entirely.
+  info "Regenerating cloud-init ISO for VM ${vmid}..."
+  qm cloudinit update "$vmid"
+  ok "Cloud-init ISO updated for VM ${vmid}"
+
   ok "VM ${vmid} configured"
 }
 
 # =============================================================================
 # Helper: wait for guest agent
-# Ubuntu 24.04 first boot installs packages (including qemu-guest-agent) via
-# cloud-init which can take 10+ minutes. 15-minute (900s) timeout.
 # =============================================================================
 wait_for_guest_agent() {
   local vmid=$1 max_wait=${2:-900} elapsed=0
@@ -890,7 +875,6 @@ first_ip() { local -n _fi=$1; echo "${_fi[0]%%/*}"; }
 
 # =============================================================================
 # Helper: wait for SSH
-# Tries deploy_ssh (which itself tries deploy key then admin key fallback).
 # =============================================================================
 wait_for_ssh() {
   local ip=$1 max_wait=300 elapsed=0
