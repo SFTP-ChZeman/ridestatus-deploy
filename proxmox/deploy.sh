@@ -102,61 +102,23 @@ info "Proxmox node: ${PROXMOX_NODE}"
 
 # =============================================================================
 # Detect suitable storages for OS disk and cloud-init drive
-#
-# OS disk  → needs 'images' content type + block/file support
-# CI drive → needs 'images' content type (cloud-init ISO is an image file)
-#
-# Proxmox storage types that support images content:
-#   dir, nfs, cifs, glusterfs, zfs, lvm, lvmthin, btrfs, cephfs, rbd
-#
-# We prefer:
-#   OS disk  → local-lvm (LVM-thin, fastest for block I/O) if available,
-#              else first images-capable storage
-#   CI drive → same as OS disk (both accept images content) OR any dir-type
-#              storage (dir storage always works for cloud-init ISOs)
 # =============================================================================
 header "Detecting Storage"
 
-find_images_storage() {
-  # Returns the name of a storage that supports 'images' content.
-  # Preference order: local-lvm, local, then whatever pvesm lists first.
-  local preferred=("local-lvm" "local")
-  for p in "${preferred[@]}"; do
-    if pvesm status --storage "$p" &>/dev/null 2>&1; then
-      local content
-      content=$(pvesm status --storage "$p" 2>/dev/null | awk 'NR>1 {print $5}' || true)
-      if echo "$content" | grep -q 'images'; then
-        echo "$p"; return 0
-      fi
-    fi
-  done
-  # Fall back: scan all storages
-  while IFS= read -r line; do
-    local name content
-    name=$(echo "$line" | awk '{print $1}')
-    content=$(echo "$line" | awk '{print $5}')
-    if echo "$content" | grep -q 'images'; then
-      echo "$name"; return 0
-    fi
-  done < <(pvesm status 2>/dev/null | awk 'NR>1' || true)
-  return 1
-}
-
 find_dir_storage() {
-  # Returns the name of a directory-type storage (best for cloud-init ISO).
   # Preference: local, then first dir-type found.
   if pvesm status --storage "local" &>/dev/null 2>&1; then
-    local type
-    type=$(pvesm status --storage "local" 2>/dev/null | awk 'NR>1 {print $2}' || true)
-    if [[ "$type" == "dir" ]]; then
+    local stype
+    stype=$(pvesm status --storage "local" 2>/dev/null | awk 'NR>1 {print $2}' || true)
+    if [[ "$stype" == "dir" ]]; then
       echo "local"; return 0
     fi
   fi
   while IFS= read -r line; do
-    local name type
+    local name stype
     name=$(echo "$line" | awk '{print $1}')
-    type=$(echo "$line" | awk '{print $2}')
-    if [[ "$type" == "dir" ]]; then
+    stype=$(echo "$line" | awk '{print $2}')
+    if [[ "$stype" == "dir" ]]; then
       echo "$name"; return 0
     fi
   done < <(pvesm status 2>/dev/null | awk 'NR>1' || true)
@@ -166,24 +128,29 @@ find_dir_storage() {
 DISK_STORAGE=""
 CI_STORAGE=""
 
-# OS disk: prefer local-lvm
+# OS disk: prefer local-lvm (LVM-thin, fast block I/O)
 if pvesm status --storage "local-lvm" &>/dev/null 2>&1; then
   DISK_STORAGE="local-lvm"
   info "OS disk storage: local-lvm"
 else
-  DISK_STORAGE=$(find_images_storage || true)
+  # Fall back to first images-capable storage
+  while IFS= read -r line; do
+    local_name=$(echo "$line" | awk '{print $1}')
+    local_content=$(echo "$line" | awk '{print $5}')
+    if echo "$local_content" | grep -q 'images'; then
+      DISK_STORAGE="$local_name"; break
+    fi
+  done < <(pvesm status 2>/dev/null | awk 'NR>1' || true)
   [[ -n "$DISK_STORAGE" ]] || die "No images-capable storage found for OS disk"
   info "OS disk storage: ${DISK_STORAGE} (local-lvm not found)"
 fi
 
-# Cloud-init drive: needs directory-type storage (not LVM-thin)
+# Cloud-init drive: needs directory-type storage (not LVM-thin block storage)
 CI_STORAGE=$(find_dir_storage || true)
 if [[ -n "$CI_STORAGE" ]]; then
   info "Cloud-init storage: ${CI_STORAGE}"
 else
-  # Last resort: enable images content type on local storage if it's dir type
-  warn "No directory storage found for cloud-init drive."
-  warn "Attempting to enable images content on 'local' storage..."
+  warn "No directory storage found — enabling images content on 'local'..."
   pvesm set local --content iso,vztmpl,backup,images 2>/dev/null \
     && CI_STORAGE="local" \
     || die "Cannot find or configure a suitable storage for cloud-init drive."
@@ -419,7 +386,9 @@ configure_vm_nics() {
         bridge_name=${EXISTING_BRIDGES[$b_idx]}
       else
         local next_num=0
-        while ip link show "vmbr${next_num}" &>/dev/null 2>&1; do (( next_num++ )); done
+        while ip link show "vmbr${next_num}" &>/dev/null 2>&1; do
+          next_num=$(( next_num + 1 ))
+        done
         prompt_default bridge_name "New bridge name" "vmbr${next_num}"
         echo "Available physical interfaces:"
         for iface in "${ALL_IFACES[@]}"; do
@@ -468,7 +437,7 @@ configure_vm_nics() {
     VM_NICS_MAC+=("$nic_mac")
     VM_NICS_IP+=("$ip_cidr"); VM_NICS_GW+=("$gw"); VM_NICS_DNS+=("$dns")
 
-    (( nic_num++ ))
+    nic_num=$(( nic_num + 1 ))
     confirm "Add another NIC to ${vm_label}?" || break
   done
 }
@@ -504,7 +473,7 @@ header "VM IDs"
 next_free_vmid() {
   local id=100
   while pvesh get "/nodes/${PROXMOX_NODE}/qemu/${id}/status" &>/dev/null 2>&1; do
-    (( id++ ))
+    id=$(( id + 1 ))
   done
   echo $id
 }
@@ -655,6 +624,10 @@ ensure_ubuntu_image() {
 
 # =============================================================================
 # Helper: create and configure a VM
+#
+# NOTE: All counter increments use x=$(( x+1 )) rather than (( x++ )) because
+# under set -e, (( expr )) exits with code 1 when the expression evaluates to
+# zero — which happens on the first increment when the counter starts at 0.
 # =============================================================================
 create_vm() {
   local vmid=$1 hostname=$2 ram_gb=$3 cores=$4 disk_gb=$5
@@ -675,12 +648,12 @@ create_vm() {
     --scsi0 "${DISK_STORAGE}:vm-${vmid}-disk-0,discard=on" --boot order=scsi0
   qm resize "$vmid" scsi0 "${disk_gb}G"
 
-  # Attach NICs
+  # Attach NICs — use x=$(( x+1 )) to avoid (( x++ )) == 0 → exit 1 under set -e
   local bridge_nic_idx=0 usb_slot=0
   for i in "${!cv_type[@]}"; do
     if [[ "${cv_type[$i]}" == "bridge" ]]; then
       qm set "$vmid" --net${bridge_nic_idx} "virtio,bridge=${cv_bridge[$i]}"
-      (( bridge_nic_idx++ ))
+      bridge_nic_idx=$(( bridge_nic_idx + 1 ))
     else
       local host_iface=${cv_usb[$i]}
       local bp=${USB_NIC_BUS_PATH[$host_iface]:-}
@@ -693,11 +666,11 @@ create_vm() {
         info "Assigning USB NIC ${host_iface} (MAC ${USB_NIC_MAC[$host_iface]:-unknown}) via host=${bp}"
         qm set "$vmid" --usb${usb_slot} "host=${bp}"
       fi
-      (( usb_slot++ ))
+      usb_slot=$(( usb_slot + 1 ))
     fi
   done
 
-  # Cloud-init drive on directory-type storage
+  # Cloud-init drive
   qm set "$vmid" --ide2 "${CI_STORAGE}:cloudinit"
 
   # SSH keys
@@ -714,7 +687,7 @@ create_vm() {
     local gw_part=""
     [[ -n "${cv_gw[$i]:-}" ]] && gw_part=",gw=${cv_gw[$i]}"
     qm set "$vmid" --ipconfig${ipconfig_idx} "ip=${ip}${gw_part}"
-    (( ipconfig_idx++ ))
+    ipconfig_idx=$(( ipconfig_idx + 1 ))
   done
 
   qm set "$vmid" --nameserver "${cv_dns[0]:-8.8.8.8}"
@@ -731,7 +704,9 @@ wait_for_guest_agent() {
   info "Waiting for guest agent on VM ${vmid} (up to ${max_wait}s)..."
   while (( elapsed < max_wait )); do
     qm guest cmd "$vmid" ping &>/dev/null 2>&1 && { ok "Guest agent ready on VM ${vmid}"; return 0; }
-    sleep 5; (( elapsed += 5 )); echo -n "."
+    sleep 5
+    elapsed=$(( elapsed + 5 ))
+    echo -n "."
   done
   echo ""; die "Timed out waiting for guest agent on VM ${vmid}"
 }
@@ -781,7 +756,7 @@ fix_usb_nic_names() {
       USB_REAL_NAME["$placeholder"]="$real_name"
       needs_fix=true
     fi
-    (( usb_slot++ ))
+    usb_slot=$(( usb_slot + 1 ))
   done
 
   $needs_fix || { ok "All NIC names correct — no netplan patch needed"; return 0; }
@@ -820,7 +795,9 @@ wait_for_ssh() {
   info "Waiting for SSH on ${ip}..."
   while (( elapsed < max_wait )); do
     deploy_ssh "$ip" 'exit 0' &>/dev/null && { ok "SSH ready on ${ip}"; return 0; }
-    sleep 5; (( elapsed += 5 )); echo -n "."
+    sleep 5
+    elapsed=$(( elapsed + 5 ))
+    echo -n "."
   done
   echo ""; die "Timed out waiting for SSH on ${ip}"
 }
