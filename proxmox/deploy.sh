@@ -744,15 +744,22 @@ create_vm() {
 
 # =============================================================================
 # Helper: wait for guest agent
+# Ubuntu 24.04 first boot installs packages via cloud-init which can take
+# 10+ minutes. Use a 15-minute (900s) timeout to accommodate slow mirrors.
 # =============================================================================
 wait_for_guest_agent() {
-  local vmid=$1 max_wait=${2:-300} elapsed=0
-  info "Waiting for guest agent on VM ${vmid} (up to ${max_wait}s)..."
+  local vmid=$1 max_wait=${2:-900} elapsed=0
+  info "Waiting for guest agent on VM ${vmid} (up to ${max_wait}s — first boot may take 10+ min)..."
   while (( elapsed < max_wait )); do
     qm guest cmd "$vmid" ping &>/dev/null 2>&1 && { ok "Guest agent ready on VM ${vmid}"; return 0; }
-    sleep 5
-    elapsed=$(( elapsed + 5 ))
-    echo -n "."
+    sleep 10
+    elapsed=$(( elapsed + 10 ))
+    # Print a dot every 10s and a timestamp every 60s so the operator knows it's alive
+    if (( elapsed % 60 == 0 )); then
+      echo " ${elapsed}s"
+    else
+      echo -n "."
+    fi
   done
   echo ""; die "Timed out waiting for guest agent on VM ${vmid}"
 }
@@ -837,7 +844,7 @@ first_ip() { local -n _fi=$1; echo "${_fi[0]%%/*}"; }
 # Helper: wait for SSH
 # =============================================================================
 wait_for_ssh() {
-  local ip=$1 max_wait=120 elapsed=0
+  local ip=$1 max_wait=300 elapsed=0
   info "Waiting for SSH on ${ip}..."
   while (( elapsed < max_wait )); do
     deploy_ssh "$ip" 'exit 0' &>/dev/null && { ok "SSH ready on ${ip}"; return 0; }
