@@ -91,6 +91,16 @@ iface_mac() { cat "/sys/class/net/${1}/address" 2>/dev/null || echo "unknown"; }
 # Helper: get all storage config as JSON via pvesh (reliable, no awk)
 storage_json() { pvesh get /storage --output-format json 2>/dev/null || echo '[]'; }
 
+# Helper: purge an IP from /root/.ssh/known_hosts so manual SSH works cleanly
+# after a VM is recreated at the same IP. The script itself uses
+# UserKnownHostsFile=/dev/null and is unaffected either way.
+purge_known_host() {
+  local ip=$1
+  if [[ -f /root/.ssh/known_hosts ]]; then
+    ssh-keygen -f /root/.ssh/known_hosts -R "$ip" &>/dev/null || true
+  fi
+}
+
 # =============================================================================
 # Preflight
 # =============================================================================
@@ -943,6 +953,7 @@ if $CREATE_SERVER; then
     SERVER_NICS_TYPE SERVER_NICS_BRIDGE SERVER_NICS_USB \
     SERVER_NICS_IP   SERVER_NICS_GW     SERVER_NICS_DNS
   qm start "$SERVER_VMID"
+  purge_known_host "$(first_ip SERVER_NICS_IP)"
   ok "VM ${SERVER_VMID} started"
 fi
 
@@ -952,6 +963,7 @@ if $CREATE_ANSIBLE; then
     ANSIBLE_NICS_TYPE ANSIBLE_NICS_BRIDGE ANSIBLE_NICS_USB \
     ANSIBLE_NICS_IP   ANSIBLE_NICS_GW     ANSIBLE_NICS_DNS
   qm start "$ANSIBLE_VMID"
+  purge_known_host "$(first_ip ANSIBLE_NICS_IP)"
   ok "VM ${ANSIBLE_VMID} started"
 fi
 
