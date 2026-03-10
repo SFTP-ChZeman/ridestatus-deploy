@@ -11,11 +11,15 @@
 #   2.  Installs Node.js 22 (via NodeSource)
 #   3.  Installs PostgreSQL 16 (via PGDG apt repo)
 #   4.  Ensures the 'ridestatus' OS user exists with correct home/permissions
-#   5.  Acquires the Ansible public key (auto via env var from deploy.sh,
-#       or prompts for key server URL, or allows manual paste as fallback)
+#   5.  Acquires the Ansible public key:
+#         a) Curls ANSIBLE_KEY_URL if set by deploy.sh (same-host mode) — no
+#            quoting issues, server.sh fetches directly from the key server
+#         b) Prompts for key server URL if not set (cross-host mode)
+#         c) Allows manual paste as fallback
 #   6.  Stores the Ansible public key and adds it to authorized_keys
 #   7.  Interactively collects park config and writes /home/ridestatus/.env
-#       Includes ANSIBLE_VM_HOST so the management UI can reach the Ansible VM
+#       ANSIBLE_VM_HOST and NIC interface names are pre-populated when
+#       deploy.sh passes RS_DEPT_NIC_HINT / RS_CORP_NIC_HINT / ANSIBLE_VM_HOST
 #   8.  Configures chrony (stratum 2, serves dept subnet)
 #   9.  Creates ridestatus DB user and database
 #  10.  Clones ridestatus-server, installs npm deps, runs DB migrations
@@ -69,6 +73,23 @@ dept_nic_subnet() {
     $(( (net_int>>24) & 0xFF )) $(( (net_int>>16) & 0xFF )) \
     $(( (net_int>>8)  & 0xFF )) $((  net_int      & 0xFF )) \
     "$prefix"
+}
+
+# Resolve a NIC hint from deploy.sh (e.g. "net0") to the actual kernel
+# interface name. For bridge NICs, Proxmox assigns ens18, ens19, etc. in
+# attachment order on Ubuntu 24.04 with virtio NICs. We map net0->ens18,
+# net1->ens19, etc. and fall back to enp0sN or the provided default.
+resolve_nic_hint() {
+  local hint=$1 default=$2
+  [[ -z "$hint" ]] && { echo "$default"; return; }
+  local idx="${hint#net}"
+  if [[ "$idx" =~ ^[0-9]+$ ]]; then
+    local candidate="ens$(( 18 + idx ))"
+    ip link show "$candidate" &>/dev/null 2>&1 && { echo "$candidate"; return; }
+    candidate="enp0s$(( idx + 1 ))"
+    ip link show "$candidate" &>/dev/null 2>&1 && { echo "$candidate"; return; }
+  fi
+  echo "$default"
 }
 
 [[ $EUID -eq 0 ]] || die "Must be run as root (sudo bash server.sh)"
@@ -148,19 +169,23 @@ ok "Home directory ready: ${RS_HOME}"
 
 # =============================================================================
 # 5 & 6. Ansible public key
+#
+# deploy.sh passes ANSIBLE_KEY_URL pointing to ansible.sh's one-shot key
+# server. server.sh curls it directly — no shell quoting issues. Falls back
+# to prompting for a URL or manual paste if not set (cross-host mode or retry).
 # =============================================================================
 header "Ansible Public Key"
 
 ANSIBLE_PUBKEY_CONTENT=""
 
-if [[ -n "${ANSIBLE_PUBKEY:-}" ]]; then
-  ANSIBLE_PUBKEY_CONTENT="$ANSIBLE_PUBKEY"
-  ok "Ansible public key received from deploy.sh (same-host mode)"
-elif [[ -n "${ANSIBLE_KEY_URL:-}" ]]; then
-  info "Fetching Ansible public key from ${ANSIBLE_KEY_URL}..."
-  ANSIBLE_PUBKEY_CONTENT=$(curl -fsSL --max-time 15 "$ANSIBLE_KEY_URL" 2>/dev/null || true)
-  [[ -n "$ANSIBLE_PUBKEY_CONTENT" ]] && ok "Ansible public key fetched from URL" \
-    || warn "Could not fetch from ANSIBLE_KEY_URL — falling back to interactive prompt"
+if [[ -n "${ANSIBLE_KEY_URL:-}" ]]; then
+  info "Fetching Ansible public key from ${ANSIBLE_KEY_URL} (provided by deploy.sh)..."
+  ANSIBLE_PUBKEY_CONTENT=$(curl -fsSL --max-time 30 "$ANSIBLE_KEY_URL" 2>/dev/null || true)
+  if [[ -n "$ANSIBLE_PUBKEY_CONTENT" ]]; then
+    ok "Ansible public key fetched successfully"
+  else
+    warn "Could not fetch from ANSIBLE_KEY_URL — key server may have timed out. Falling back."
+  fi
 fi
 
 if [[ -z "$ANSIBLE_PUBKEY_CONTENT" ]]; then
@@ -241,21 +266,26 @@ else
   info "NIC interfaces — shown below for reference:"
   ip -o link show | awk -F': ' '{print "  "$2}' | grep -v lo
   echo ""
-  prompt_default DEPT_NIC_INTERFACE     "Dept/RideStatus network NIC" "ens18"
-  prompt_default EXTERNAL_NIC_INTERFACE "Corporate/external NIC"      "ens19"
+
+  # Pre-populate NIC defaults from role hints passed by deploy.sh
+  DEPT_NIC_DEFAULT=$(resolve_nic_hint "${RS_DEPT_NIC_HINT:-}" "ens18")
+  CORP_NIC_DEFAULT=$(resolve_nic_hint "${RS_CORP_NIC_HINT:-}" "ens19")
+
+  prompt_default DEPT_NIC_INTERFACE     "Department / RideStatus network NIC (chrony, management UI, edge traffic)" "$DEPT_NIC_DEFAULT"
+  prompt_default EXTERNAL_NIC_INTERFACE "Corporate / external NIC (internet, corporate VLAN)"                       "$CORP_NIC_DEFAULT"
 
   echo ""
   info "Ansible VM — the management UI uses this to deploy edge nodes"
   echo "  Leave blank if you do not have an Ansible VM yet."
   echo "  You can set ANSIBLE_VM_HOST in ${ENV_FILE} later."
-  prompt_default ANSIBLE_VM_HOST "Ansible VM dept-NIC IP" ""
+  ANSIBLE_VM_HOST_DEFAULT="${ANSIBLE_VM_HOST:-}"
+  prompt_default ANSIBLE_VM_HOST "Ansible VM dept-NIC IP" "$ANSIBLE_VM_HOST_DEFAULT"
 
   echo ""
   info "Optional: weather and alerting (leave blank to configure later)"
   prompt_default WEATHER_ZIP  "Weather ZIP code"    ""
   prompt_default ALERT_EMAIL  "Alert email address" ""
 
-  # Derive dept NIC IP for ANSIBLE_VM_KEY_PATH reference
   DEPT_NIC_IP_NOW=$(ip -4 addr show dev "${DEPT_NIC_INTERFACE}" 2>/dev/null \
     | awk '/inet /{split($2,a,"/"); print a[1]}' | head -1 || true)
 
@@ -279,8 +309,11 @@ API_KEY=${API_KEY}
 
 SERVER_BOOTSTRAP_TOKEN=${SERVER_BOOTSTRAP_TOKEN}
 
+# Department / RideStatus network — chrony NTP, management UI, edge node traffic
 DEPT_NIC_INTERFACE=${DEPT_NIC_INTERFACE}
 DEPT_NIC_IP=${DEPT_NIC_IP_NOW}
+
+# Corporate / external network — internet access, corporate VLAN
 EXTERNAL_NIC_INTERFACE=${EXTERNAL_NIC_INTERFACE}
 
 ANSIBLE_PUBKEY_PATH=${ANSIBLE_PUBKEY_FILE}
