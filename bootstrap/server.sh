@@ -12,7 +12,7 @@
 #   3.  Installs PostgreSQL 16 (via PGDG apt repo)
 #   4.  Ensures the 'ridestatus' OS user exists with correct home/permissions
 #   5.  Acquires the Ansible public key:
-#         a) Curls ANSIBLE_KEY_URL if set by deploy.sh (same-host mode) — no
+#         a) Curls ANSIBLE_KEY_URL if set by deploy.sh (same-host mode) -- no
 #            quoting issues, server.sh fetches directly from the key server
 #         b) Prompts for key server URL if not set (cross-host mode)
 #         c) Allows manual paste as fallback
@@ -29,6 +29,12 @@
 #
 # Usage (called by deploy.sh via SSH, or manually):
 #   curl -fsSL https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap/server.sh | sudo bash
+#
+# TTY note:
+#   This script is often run as "curl ... | sudo bash", which means stdin is
+#   the script itself -- not the terminal. All interactive read calls use
+#   /dev/tty explicitly so prompts always reach the tech's terminal regardless
+#   of how stdin is connected.
 # =============================================================================
 
 set -euo pipefail
@@ -42,16 +48,19 @@ warn()   { echo -e "${YELLOW}[server.sh]${RESET} $*"; }
 die()    { echo -e "${RED}[server.sh] ERROR:${RESET} $*" >&2; exit 1; }
 header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
 
+# All interactive prompts read from /dev/tty so they work even when the script
+# is piped into bash (curl ... | sudo bash). In that mode, stdin is the script
+# itself and read would get EOF immediately without this redirection.
 prompt_default() {
   local -n _var=$1; local msg=$2 def=$3
-  read -rp "$(echo -e "${BOLD}${msg}${RESET} [${def}]: ")" _var
+  read -rp "$(echo -e "${BOLD}${msg}${RESET} [${def}]: ")" _var </dev/tty
   _var=${_var:-$def}
 }
 
 prompt_required() {
   local -n _var=$1; local msg=$2
   while true; do
-    read -rp "$(echo -e "${BOLD}${msg}${RESET}: ")" _var
+    read -rp "$(echo -e "${BOLD}${msg}${RESET}: ")" _var </dev/tty
     [[ -n "$_var" ]] && break
     warn "This field is required."
   done
@@ -76,9 +85,15 @@ dept_nic_subnet() {
 }
 
 # Resolve a NIC hint from deploy.sh (e.g. "net0") to the actual kernel
-# interface name. For bridge NICs, Proxmox assigns ens18, ens19, etc. in
-# attachment order on Ubuntu 24.04 with virtio NICs. We map net0->ens18,
-# net1->ens19, etc. and fall back to enp0sN or the provided default.
+# interface name.
+#
+# Strategy (in order):
+#   1. Try ens<18+idx> -- the typical name for virtio NICs on Ubuntu 24.04
+#      under Proxmox (ens18, ens19, ...)
+#   2. Try enp0s<idx+1> -- alternate naming seen on some configs
+#   3. Scan all actual non-loopback interfaces sorted by name, pick by index
+#      -- catches eth0, ens3, enp3s0, etc. regardless of naming convention
+#   4. Fall back to provided default
 resolve_nic_hint() {
   local hint=$1 default=$2
   [[ -z "$hint" ]] && { echo "$default"; return; }
@@ -88,6 +103,21 @@ resolve_nic_hint() {
     ip link show "$candidate" &>/dev/null 2>&1 && { echo "$candidate"; return; }
     candidate="enp0s$(( idx + 1 ))"
     ip link show "$candidate" &>/dev/null 2>&1 && { echo "$candidate"; return; }
+    # Scan actual interfaces: exclude lo, virtual (veth/tap/br/vmbr/docker)
+    local -a real_ifaces=()
+    while IFS= read -r iface; do
+      real_ifaces+=("$iface")
+    done < <(
+      ip -o link show \
+        | awk -F': ' '{print $2}' \
+        | grep -v '^lo$' \
+        | grep -Ev '^(veth|tap|br-|docker|vmbr|dummy)' \
+        | sort
+    )
+    if (( idx < ${#real_ifaces[@]} )); then
+      echo "${real_ifaces[$idx]}"
+      return
+    fi
   fi
   echo "$default"
 }
@@ -171,8 +201,9 @@ ok "Home directory ready: ${RS_HOME}"
 # 5 & 6. Ansible public key
 #
 # deploy.sh passes ANSIBLE_KEY_URL pointing to ansible.sh's one-shot key
-# server. server.sh curls it directly — no shell quoting issues. Falls back
+# server. server.sh curls it directly -- no shell quoting issues. Falls back
 # to prompting for a URL or manual paste if not set (cross-host mode or retry).
+# Prompts use /dev/tty so they work when stdin is the piped script.
 # =============================================================================
 header "Ansible Public Key"
 
@@ -184,7 +215,7 @@ if [[ -n "${ANSIBLE_KEY_URL:-}" ]]; then
   if [[ -n "$ANSIBLE_PUBKEY_CONTENT" ]]; then
     ok "Ansible public key fetched successfully"
   else
-    warn "Could not fetch from ANSIBLE_KEY_URL — key server may have timed out. Falling back."
+    warn "Could not fetch from ANSIBLE_KEY_URL -- key server may have timed out. Falling back."
   fi
 fi
 
@@ -194,7 +225,7 @@ if [[ -z "$ANSIBLE_PUBKEY_CONTENT" ]]; then
   echo "  The Ansible VM printed a key server URL when ansible.sh ran."
   echo "  Example: http://10.15.140.100:${KEY_SERVER_PORT}/ansible_ridestatus.pub"
   echo ""
-  read -rp "$(echo -e "${BOLD}  Key server URL (or press Enter to paste manually): ${RESET}")" key_url
+  read -rp "$(echo -e "${BOLD}  Key server URL (or press Enter to paste manually): ${RESET}")" key_url </dev/tty
 
   if [[ -n "$key_url" ]]; then
     ANSIBLE_PUBKEY_CONTENT=$(curl -fsSL --max-time 15 "$key_url" 2>/dev/null || true)
@@ -206,9 +237,9 @@ if [[ -z "$ANSIBLE_PUBKEY_CONTENT" ]]; then
     echo ""
     echo -e "${BOLD}  Paste the Ansible public key (starts with 'ssh-ed25519'):${RESET}"
     while true; do
-      read -rp "  Public key: " ANSIBLE_PUBKEY_CONTENT
+      read -rp "  Public key: " ANSIBLE_PUBKEY_CONTENT </dev/tty
       echo "$ANSIBLE_PUBKEY_CONTENT" | grep -qE '^(ssh-ed25519|ssh-rsa|ecdsa-sha2) ' && break
-      warn "  Does not look like a valid public key — try again."
+      warn "  Does not look like a valid public key -- try again."
     done
   fi
 fi
@@ -231,15 +262,17 @@ else
 fi
 
 # =============================================================================
-# 7. Park configuration — interactive, writes .env
+# 7. Park configuration -- interactive, writes .env
+#
+# All read calls use /dev/tty so prompts work when stdin is the piped script.
 # =============================================================================
 header "Park Configuration"
 
 if [[ -f "$ENV_FILE" ]]; then
-  info ".env already exists — leaving intact (rm ${ENV_FILE} to reconfigure)"
+  info ".env already exists -- leaving intact (rm ${ENV_FILE} to reconfigure)"
   source "$ENV_FILE"
 else
-  info "Collecting park configuration — writes ${ENV_FILE}"
+  info "Collecting park configuration -- writes ${ENV_FILE}"
   echo ""
 
   prompt_required PARK_NAME     "Park name (e.g. Six Flags Great America)"
@@ -263,7 +296,7 @@ else
   SERVER_BOOTSTRAP_TOKEN="${SERVER_BOOTSTRAP_TOKEN:0:8}"
 
   echo ""
-  info "NIC interfaces — shown below for reference:"
+  info "NIC interfaces -- shown below for reference:"
   ip -o link show | awk -F': ' '{print "  "$2}' | grep -v lo
   echo ""
 
@@ -275,7 +308,7 @@ else
   prompt_default EXTERNAL_NIC_INTERFACE "Corporate / external NIC (internet, corporate VLAN)"                       "$CORP_NIC_DEFAULT"
 
   echo ""
-  info "Ansible VM — the management UI uses this to deploy edge nodes"
+  info "Ansible VM -- the management UI uses this to deploy edge nodes"
   echo "  Leave blank if you do not have an Ansible VM yet."
   echo "  You can set ANSIBLE_VM_HOST in ${ENV_FILE} later."
   ANSIBLE_VM_HOST_DEFAULT="${ANSIBLE_VM_HOST:-}"
@@ -291,7 +324,7 @@ else
 
   cat > "$ENV_FILE" << EOF
 # =============================================================================
-# RideStatus Server — Environment
+# RideStatus Server -- Environment
 # Generated by server.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # =============================================================================
 
@@ -309,16 +342,16 @@ API_KEY=${API_KEY}
 
 SERVER_BOOTSTRAP_TOKEN=${SERVER_BOOTSTRAP_TOKEN}
 
-# Department / RideStatus network — chrony NTP, management UI, edge node traffic
+# Department / RideStatus network -- chrony NTP, management UI, edge node traffic
 DEPT_NIC_INTERFACE=${DEPT_NIC_INTERFACE}
 DEPT_NIC_IP=${DEPT_NIC_IP_NOW}
 
-# Corporate / external network — internet access, corporate VLAN
+# Corporate / external network -- internet access, corporate VLAN
 EXTERNAL_NIC_INTERFACE=${EXTERNAL_NIC_INTERFACE}
 
 ANSIBLE_PUBKEY_PATH=${ANSIBLE_PUBKEY_FILE}
 
-# Ansible VM — used by the management UI to deploy edge nodes remotely
+# Ansible VM -- used by the management UI to deploy edge nodes remotely
 # Set to the Ansible VM's dept-NIC IP address after running ansible.sh there.
 ANSIBLE_VM_HOST=${ANSIBLE_VM_HOST:-}
 ANSIBLE_VM_USER=ridestatus
@@ -357,15 +390,15 @@ header "Configuring NTP (chrony)"
 DEPT_SUBNET=$(dept_nic_subnet "${DEPT_NIC_INTERFACE:-ens18}" || true)
 
 if [[ -z "$DEPT_SUBNET" ]]; then
-  warn "Could not determine subnet for ${DEPT_NIC_INTERFACE} — using 10.0.0.0/8 fallback"
+  warn "Could not determine subnet for ${DEPT_NIC_INTERFACE} -- using 10.0.0.0/8 fallback"
   DEPT_SUBNET="10.0.0.0/8"
 else
   ok "Dept NIC subnet: ${DEPT_SUBNET}"
 fi
 
 cat > /etc/chrony/chrony.conf << EOF
-# RideStatus Aggregation Server — chrony config
-# Generated by server.sh — $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# RideStatus Aggregation Server -- chrony config
+# Generated by server.sh -- $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 pool pool.ntp.org iburst minpoll 6 maxpoll 10
 allow ${DEPT_SUBNET}
 local stratum 3
@@ -383,12 +416,12 @@ for i in $(seq 1 6); do
   sleep 5
 done
 chronyc tracking | grep 'Leap status' \
-  || warn "chrony not yet synced — may need internet route on ${EXTERNAL_NIC_INTERFACE:-ens19}"
+  || warn "chrony not yet synced -- may need internet route on ${EXTERNAL_NIC_INTERFACE:-ens19}"
 
 ok "chrony configured (allow ${DEPT_SUBNET})"
 
 # =============================================================================
-# 9. PostgreSQL — create user and database
+# 9. PostgreSQL -- create user and database
 # =============================================================================
 header "Configuring PostgreSQL"
 
@@ -412,7 +445,7 @@ ok "PostgreSQL user '${POSTGRES_USER}' and database '${POSTGRES_DB}' ready"
 header "Deploying ridestatus-server"
 
 if [[ -d "${APP_DIR}/.git" ]]; then
-  info "Repo already cloned — pulling latest"
+  info "Repo already cloned -- pulling latest"
   sudo -u "$RS_USER" git -C "$APP_DIR" pull --ff-only
 else
   sudo -u "$RS_USER" git clone "$APP_REPO" "$APP_DIR"
@@ -429,7 +462,7 @@ chown "${RS_USER}:${RS_USER}" "$LOG_DIR"
 
 sudo -u "$RS_USER" bash -c "cd ${APP_DIR} && node db/migrate.js" \
   && ok "Migrations complete" \
-  || die "Migration failed — check ${LOG_DIR}/server-err.log"
+  || die "Migration failed -- check ${LOG_DIR}/server-err.log"
 
 # =============================================================================
 # 11. PM2
@@ -466,7 +499,7 @@ ufw default allow outgoing
 ufw allow ssh                                           comment "Admin SSH"
 ufw allow "${API_PORT:-3100}/tcp"                      comment "RideStatus API + UI"
 ufw allow from "${DEPT_SUBNET}" to any port 123 proto udp \
-                                                        comment "NTP — dept network only"
+                                                        comment "NTP -- dept network only"
 ufw --force enable
 
 ok "Firewall configured"
@@ -496,7 +529,7 @@ echo -e "${BOLD}${GREEN}║  Dept NTP subnet:  ${DEPT_SUBNET}$(printf '%*s' $((4
 if [[ -n "${ANSIBLE_VM_HOST:-}" ]]; then
 echo -e "${BOLD}${GREEN}║  Ansible VM:       ${ANSIBLE_VM_HOST}$(printf '%*s' $((44 - ${#ANSIBLE_VM_HOST})) '')║${RESET}"
 else
-echo -e "${BOLD}${YELLOW}║  Ansible VM:       not set — add ANSIBLE_VM_HOST to .env    ║${RESET}"
+echo -e "${BOLD}${YELLOW}║  Ansible VM:       not set -- add ANSIBLE_VM_HOST to .env   ║${RESET}"
 fi
 echo -e "${BOLD}${GREEN}║                                                              ║${RESET}"
 echo -e "${BOLD}${GREEN}║  Next steps:                                                 ║${RESET}"
